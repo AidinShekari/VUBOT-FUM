@@ -66,17 +66,19 @@ pm2 save
 
 ## Environment Variables
 
-| Variable | Description |
-|----------|-------------|
-| `TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather |
-| `TELEGRAM_CHAT_ID` | Target chat/group ID for notifications |
-| `TELEGRAM_TOPIC_ID` | (Optional) Topic ID for forum groups |
-| `TELEGRAM_ADMIN_CHAT_ID` | Admin chat ID for captcha handling |
-| `VU_USERNAME` | University student ID |
-| `VU_PASSWORD` | University password |
-| `COURSE_URLS` | Comma-separated course URLs to monitor |
-| `CHECK_INTERVAL` | Check interval in minutes (default: 10) |
-| `DEBUG_MODE` | Enable debug logging (true/false) |
+| Variable                 | Description                             |
+| ------------------------ | --------------------------------------- |
+| `TELEGRAM_BOT_TOKEN`     | Telegram bot token from @BotFather      |
+| `TELEGRAM_CHAT_ID`       | Target chat/group ID for notifications  |
+| `TELEGRAM_TOPIC_ID`      | (Optional) Topic ID for forum groups    |
+| `TELEGRAM_ADMIN_CHAT_ID` | Admin chat ID for captcha handling      |
+| `VU_USERNAME`            | University student ID                   |
+| `VU_PASSWORD`            | University password                     |
+| `COURSE_URLS`            | Comma-separated course URLs to monitor  |
+| `CHECK_INTERVAL`         | Check interval in minutes (default: 10) |
+| `DEBUG_MODE`             | Enable debug logging (true/false)       |
+| `CHROME_PATH`            | (Optional) Set Chrome executable path   |
+| `HTTP_PROXY`             | (Optional) Set Proxy for telegram bot   |
 
 ## License
 

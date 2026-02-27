@@ -20,11 +20,21 @@ const CONFIG = {
         courseUrls: process.env.COURSE_URLS.split(',')
     },
     checkInterval: parseInt(process.env.CHECK_INTERVAL) || 5,
-    debug: process.env.DEBUG_MODE === 'true' || false
+    debug: process.env.DEBUG_MODE === 'true' || false,
+    chromePath: process.env.CHROME_PATH || null,
+    httpProxy: process.env.HTTP_PROXY || null
 };
+
+if (CONFIG.httpProxy) {
+    console.log("Using Proxy: ", CONFIG.httpProxy)
+}
 const bot = new TelegramBot(CONFIG.telegram.token, {
-    polling: true
+    polling: true,
+    request: {
+        proxy: CONFIG.httpProxy
+    }
 });
+
 let monitor = null;
 const DATA_FILE = 'course_data.json';
 
@@ -54,12 +64,12 @@ class VUMonitor {
             '/usr/bin/google-chrome-stable',
             '/snap/bin/chromium'
         ];
-        
-            const chromePath = possiblePaths.find(path => path && require('fs').existsSync(path));
-            if (chromePath) {
-                return chromePath;
-            }
-        
+
+        const chromePath = possiblePaths.find(path => path && require('fs').existsSync(path));
+        if (chromePath) {
+            return chromePath;
+        }
+
         return null;
     }
     async isBrowserHealthy() {
@@ -77,18 +87,18 @@ class VUMonitor {
             return false;
         }
     }
-    
+
     async clearBrowserCache() {
         try {
             if (!this.page || this.page.isClosed()) {
                 return;
             }
-            
+
             const client = await this.page.target().createCDPSession();
             await client.send('Network.clearBrowserCache');
             await client.send('Network.clearBrowserCookies');
             await client.detach();
-            
+
             console.log('🧹 Browser cache cleared');
         } catch (error) {
             console.log('⚠️ Could not clear browser cache:', error.message);
@@ -96,9 +106,9 @@ class VUMonitor {
     }
     async initialize() {
         console.log('🚀 Initializing VU Monitor...');
-        
+
         await this.loadData();
-        
+
         if (this.browser) {
             try {
                 await this.browser.close();
@@ -107,10 +117,20 @@ class VUMonitor {
                 console.log('⚠️ Error closing existing browser:', error.message);
             }
         }
-        
+
+        let chromePath;
+        if (CONFIG.chromePath) {
+            chromePath = CONFIG.chromePath;
+        } else {
+            chromePath = this.findChromePath();
+            console.log("couldnt find chrome path in .env, trying to guess...")
+        }
+
+        console.log('chrome path:', chromePath);
+
         this.browser = await puppeteer.launch({
             headless: true,
-            executablePath: '/usr/bin/chromium-browser',
+            executablePath: chromePath,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -123,7 +143,7 @@ class VUMonitor {
         this.page = await this.browser.newPage();
         await this.page.setViewport({ width: 1920, height: 1080 });
         await this.page.setCacheEnabled(false);
-        
+
         await new Promise(r => setTimeout(r, 1000));
         console.log('✅ Browser initialized');
     }
@@ -138,7 +158,7 @@ class VUMonitor {
             this.courseData = {};
             this.isFirstRun = true;
         }
-        
+
         try {
             const msgData = await fs.readFile('message_ids.json', 'utf8');
             this.courseMessageIds = JSON.parse(msgData);
@@ -155,7 +175,7 @@ class VUMonitor {
             console.log('⏰ No deadline message ID found');
             this.deadlineMessageId = null;
         }
-        
+
         try {
             const reminderData = await fs.readFile('reminders.json', 'utf8');
             this.sentReminders = JSON.parse(reminderData);
@@ -164,7 +184,7 @@ class VUMonitor {
             console.log('⏰ No reminder history found');
             this.sentReminders = {};
         }
-        
+
         try {
             const lastDayData = await fs.readFile('last_day_reminders.json', 'utf8');
             this.sentLastDayReminders = JSON.parse(lastDayData);
@@ -187,10 +207,10 @@ class VUMonitor {
     }
     async login() {
         console.log('🔐 Logging in...');
-        
+
         const maxRetries = 3;
         let retryCount = 0;
-        
+
         while (retryCount < maxRetries) {
             try {
                 const isHealthy = await this.isBrowserHealthy();
@@ -198,13 +218,13 @@ class VUMonitor {
                     console.log('🔧 Browser not healthy, reinitializing...');
                     await this.initialize();
                 }
-                
+
                 console.log('📍 Navigating to VU login page...');
                 await this.page.goto('https://vu.um.ac.ir/login/index.php', {
                     waitUntil: 'domcontentloaded',
                     timeout: 60000
                 });
-                
+
                 await new Promise(r => setTimeout(r, 5000));
                 const loginBtnSelector = '.btn.login-identityprovider-btn.btn-block';
                 try {
@@ -217,47 +237,47 @@ class VUMonitor {
                 }
                 console.log('⏳ Waiting for login page...');
                 await this.page.waitForSelector('input[name="UserID"], input[placeholder*="کاربری"]', { timeout: 30000 });
-                
+
                 await new Promise(r => setTimeout(r, 2000));
-                
+
                 await this.page.evaluate(() => {
                     const inputs = document.querySelectorAll('input');
                     inputs.forEach(input => input.value = '');
                 });
-                
+
                 console.log('📝 Entering credentials...');
                 const usernameSelector = await this.page.$('input[name="UserID"]') ? 'input[name="UserID"]' : 'input[placeholder*="کاربری"]';
                 const passwordSelector = await this.page.$('input[name="password"]') ? 'input[name="password"]' : 'input[placeholder*="رمز"]';
-                
+
                 await this.page.waitForSelector(usernameSelector, { visible: true, timeout: 10000 });
                 await this.page.click(usernameSelector);
                 await this.page.type(usernameSelector, CONFIG.vu.username, { delay: 100 });
-                
+
                 await this.page.waitForSelector(passwordSelector, { visible: true, timeout: 10000 });
                 await this.page.click(passwordSelector);
                 await this.page.type(passwordSelector, CONFIG.vu.password, { delay: 100 });
-                
+
                 const captchaImg = await this.page.$('#captcha-img');
                 if (captchaImg) {
                     console.log('🧩 Captcha detected, handling...');
-                    
+
                     const captchaSrc = await this.page.$eval('#captcha-img', el => el.src);
                     const base64Data = captchaSrc.replace(/^data:image\/\w+;base64,/, '');
                     const buffer = Buffer.from(base64Data, 'base64');
-                    
+
                     await bot.sendPhoto(CONFIG.telegram.adminChatId, buffer, {
                         caption: '🔒 لطفا کد امنیتی را وارد کنید:'
                     });
-                    
+
                     const captchaCode = await this.waitForTelegramResponse();
                     console.log(`✅ Captcha code received: ${captchaCode}`);
-                    
+
                     await this.page.type('input[name="mysecpngco"]', captchaCode);
-                    
+
                     await new Promise(r => setTimeout(r, 1000));
                 }
                 console.log('🔐 Submitting login form...');
-                
+
                 const navigationPromise = this.page.waitForNavigation({
                     waitUntil: ['domcontentloaded', 'networkidle2'],
                     timeout: 120000
@@ -265,7 +285,7 @@ class VUMonitor {
                     console.log('⚠️ Navigation timeout, checking if login succeeded anyway...');
                     return null;
                 });
-                
+
                 const loginButtonClicked = await this.page.evaluate(() => {
                     const buttons = Array.from(document.querySelectorAll('button'));
                     const loginButton = buttons.find(button => button.textContent.includes('ورود'));
@@ -275,20 +295,20 @@ class VUMonitor {
                     }
                     return false;
                 });
-                
+
                 if (!loginButtonClicked) {
                     throw new Error('Login button not found');
                 }
-                
+
                 console.log('⏳ Waiting for login redirect...');
                 await navigationPromise;
-                
+
                 console.log('⏳ Waiting for session to establish...');
                 await new Promise(r => setTimeout(r, 8000));
-                
+
                 const currentUrl = this.page.url();
                 console.log(`📍 Current URL after login: ${currentUrl}`);
-                
+
                 if (currentUrl.includes('vu.um.ac.ir')) {
                     console.log('✅ Login successful');
                     return;
@@ -298,10 +318,10 @@ class VUMonitor {
             } catch (error) {
                 retryCount++;
                 console.error(`❌ Login attempt ${retryCount} failed:`, error.message);
-                
+
                 if (retryCount < maxRetries) {
                     console.log(`🔄 Retrying login (${retryCount}/${maxRetries})...`);
-                    
+
                     try {
                         console.log('🔄 Reinitializing browser for retry...');
                         await this.initialize();
@@ -315,7 +335,7 @@ class VUMonitor {
                             throw new Error(`Failed to reinitialize browser: ${finalError.message}`);
                         }
                     }
-                    
+
                     await new Promise(r => setTimeout(r, 10000));
                 } else {
                     throw new Error(`Login failed after ${maxRetries} attempts: ${error.message}`);
@@ -325,7 +345,7 @@ class VUMonitor {
     }
     async waitForTelegramResponse() {
         console.log('⏳ Waiting for captcha code from Telegram...');
-        
+
         return new Promise((resolve) => {
             const checkUpdates = async () => {
                 try {
@@ -337,12 +357,12 @@ class VUMonitor {
                     if (updates.length > 0) {
                         const update = updates[0];
                         const message = update.message;
-                        
+
                         if (message &&
                             message.chat.id.toString() === CONFIG.telegram.adminChatId &&
                             message.text &&
                             (Date.now() / 1000 - message.date) < 30) {
-                            
+
                             await bot.sendMessage(CONFIG.telegram.adminChatId, '✅ کد دریافت شد, در حال ورود...');
                             resolve(message.text.trim());
                             return;
@@ -351,24 +371,24 @@ class VUMonitor {
                 } catch (error) {
                     console.error('Error checking Telegram updates:', error.message);
                 }
-                
+
                 setTimeout(checkUpdates, 2000);
             };
-            
+
             checkUpdates();
         });
     }
     async checkCourse(courseUrl) {
         console.log(`📚 Checking course: ${courseUrl}`);
-        
+
         try {
             await this.page.goto(courseUrl, {
                 waitUntil: 'domcontentloaded',
                 timeout: 90000
             });
-            
+
             await new Promise(r => setTimeout(r, 4000));
-            
+
             console.log(`📍 Navigated to: ${this.page.url()}`);
         } catch (error) {
             console.error(`❌ Failed to navigate to course: ${error.message}`);
@@ -379,12 +399,12 @@ class VUMonitor {
             if (breadcrumb) {
                 return breadcrumb.textContent.trim();
             }
-            
+
             const header = document.querySelector('.page-header-headings h1');
             if (header) {
                 return header.textContent.trim();
             }
-            
+
             return 'Unknown Course';
         });
         console.log(`📖 Course: ${courseName}`);
@@ -400,11 +420,11 @@ class VUMonitor {
                 lastChecked: null
             };
         }
-        
+
         if (!this.courseData[courseId].sentFiles) {
             this.courseData[courseId].sentFiles = {};
         }
-        
+
         if (!this.courseData[courseId].sentNotifications) {
             this.courseData[courseId].sentNotifications = {};
         }
@@ -425,7 +445,7 @@ class VUMonitor {
                 throw error;
             }
         }
-        
+
         try {
             if (!this.courseData[courseId].assignments) {
                 this.courseData[courseId].assignments = {};
@@ -476,15 +496,15 @@ class VUMonitor {
         } catch (err) {
             console.error('Error ensuring stored assignment/quiz details:', err.message);
         }
-        
+
         const changes = this.detectChanges(courseId, sections);
-        
+
         if (changes.updatedItems.length > 0) {
             await this.checkForUpdates(courseId, courseName, changes.updatedItems);
         }
-        
+
         await this.sendOrUpdateCourseOverview(courseId, courseName, courseUrl, sections);
-        
+
         if (changes.hasChanges) {
             await this.notifyNewActivities(courseId, courseName, changes);
         }
@@ -522,9 +542,9 @@ class VUMonitor {
             }
             const activities = await this.page.evaluate(() => {
                 const result = {};
-                
+
                 let sectionElements = document.querySelectorAll('li.section.course-section[data-for="section"]');
-                
+
                 if (sectionElements.length === 0) {
                     sectionElements = document.querySelectorAll('ul.topics > li.section');
                 }
@@ -534,28 +554,28 @@ class VUMonitor {
                 if (sectionElements.length === 0) {
                     sectionElements = document.querySelectorAll('li.section');
                 }
-                
+
                 sectionElements.forEach((section, index) => {
                     let sectionName = '';
-                    
+
                     const sectionNameElement = section.querySelector('h3.sectionname[data-for="section_title"]') ||
-                                             section.querySelector('h3[class*="sectionname"]') ||
-                                             section.querySelector('.sectionname') ||
-                                             section.querySelector('h3');
-                    
+                        section.querySelector('h3[class*="sectionname"]') ||
+                        section.querySelector('.sectionname') ||
+                        section.querySelector('h3');
+
                     if (sectionNameElement) {
                         sectionName = sectionNameElement.textContent.trim();
                     }
-                    
+
                     if (!sectionName || sectionName === '') {
                         sectionName = `بخش ${index}`;
                     }
-                    
+
                     const activities = [];
-                    
+
                     let activityContainer = section.querySelector('ul[data-for="cmlist"]') || section;
                     let activityElements = activityContainer.querySelectorAll('li.activity[data-for="cmitem"]');
-                    
+
                     if (activityElements.length === 0) {
                         activityElements = activityContainer.querySelectorAll('li.activity.activity-wrapper');
                     }
@@ -565,18 +585,18 @@ class VUMonitor {
                     if (activityElements.length === 0) {
                         activityElements = section.querySelectorAll('li[class*="modtype_"]');
                     }
-                    
+
                     activityElements.forEach(activity => {
                         let activityName = 'Unknown';
-                        
+
                         const activityItem = activity.querySelector('.activity-item[data-activityname]');
                         if (activityItem && activityItem.dataset.activityname) {
                             activityName = activityItem.dataset.activityname.trim();
                         } else {
                             const instanceElement = activity.querySelector('.instancename') ||
-                                                  activity.querySelector('.activityname a span') ||
-                                                  activity.querySelector('.activityname');
-                            
+                                activity.querySelector('.activityname a span') ||
+                                activity.querySelector('.activityname');
+
                             if (instanceElement) {
                                 const clone = instanceElement.cloneNode(true);
                                 const iconsToRemove = clone.querySelectorAll('.accesshide, .badge, .sr-only');
@@ -584,17 +604,17 @@ class VUMonitor {
                                 activityName = clone.textContent.trim();
                             }
                         }
-                        
+
                         const activityType = activity.className.match(/modtype_(\w+)/)?.[1] ||
-                                            activity.className.match(/modtype-(\w+)/)?.[1] ||
-                                            'unknown';
-                        
+                            activity.className.match(/modtype-(\w+)/)?.[1] ||
+                            'unknown';
+
                         const activityLink = activity.querySelector('a.aalink.stretched-link') ||
-                                            activity.querySelector('a.aalink') ||
-                                            activity.querySelector('a[href*="/mod/"]') ||
-                                            activity.querySelector('.activityname a');
+                            activity.querySelector('a.aalink') ||
+                            activity.querySelector('a[href*="/mod/"]') ||
+                            activity.querySelector('.activityname a');
                         const activityUrl = activityLink ? activityLink.href : '';
-                        
+
                         if (activityName && activityName !== 'Unknown' && activityUrl) {
                             activities.push({
                                 name: activityName,
@@ -603,12 +623,12 @@ class VUMonitor {
                             });
                         }
                     });
-                    
+
                     if (activities.length > 0) {
                         result[sectionName] = activities;
                     }
                 });
-                
+
                 return result;
             });
             return activities;
@@ -627,21 +647,21 @@ class VUMonitor {
             const details = await this.page.evaluate(() => {
                 let opened = 'نامشخص';
                 let closed = 'نامشخص';
-                
+
                 const activityDates = document.querySelector('[data-region="activity-dates"]');
                 if (activityDates) {
                     const datesDivs = activityDates.querySelectorAll('.description-inner > div');
-                    
+
                     datesDivs.forEach(div => {
                         const text = div.textContent;
-                        
+
                         if (text.includes('باز شده:') || text.includes('Opened:')) {
                             const match = text.match(/(?:باز شده:|Opened:)\s*(.+)/);
                             if (match) {
                                 opened = match[1].trim();
                             }
                         }
-                        
+
                         if (text.includes('بسته شده:') || text.includes('Closed:')) {
                             const match = text.match(/(?:بسته شده:|Closed:)\s*(.+)/);
                             if (match) {
@@ -669,21 +689,21 @@ class VUMonitor {
                 let opened = 'نامشخص';
                 let deadline = 'نامشخص';
                 const attachments = [];
-                
+
                 const activityDates = document.querySelector('[data-region="activity-dates"]');
                 if (activityDates) {
                     const datesDivs = activityDates.querySelectorAll('.description-inner > div');
-                    
+
                     datesDivs.forEach(div => {
                         const text = div.textContent;
-                        
+
                         if (text.includes('باز شده:') || text.includes('Opened:')) {
                             const match = text.match(/(?:باز شده:|Opened:)\s*(.+)/);
                             if (match) {
                                 opened = match[1].trim();
                             }
                         }
-                        
+
                         if (text.includes('مهلت:') || text.includes('Due:')) {
                             const match = text.match(/(?:مهلت:|Due:)\s*(.+)/);
                             if (match) {
@@ -692,61 +712,61 @@ class VUMonitor {
                         }
                     });
                 }
-                
+
                 const introSection = document.querySelector('.activity-description#intro') ||
-                                    document.querySelector('div.activity-description') ||
-                                    document.querySelector('#intro');
-                
+                    document.querySelector('div.activity-description') ||
+                    document.querySelector('#intro');
+
                 if (introSection) {
                     const fileLinks = introSection.querySelectorAll('a[href*="pluginfile.php"]');
-                    
+
                     fileLinks.forEach(link => {
                         const url = link.href;
                         let fileName = link.textContent.trim();
-                        
+
                         if (!fileName || fileName === '') {
                             const urlParts = url.split('/');
                             fileName = urlParts[urlParts.length - 1].split('?')[0];
                             fileName = decodeURIComponent(fileName);
                         }
-                        
+
                         const exists = attachments.find(a => a.url === url);
                         const isValidFile = url && fileName &&
-                                          !url.includes('/theme/image.php') &&
-                                          !url.includes('/core/') &&
-                                          fileName.length > 2;
-                        
+                            !url.includes('/theme/image.php') &&
+                            !url.includes('/core/') &&
+                            fileName.length > 2;
+
                         if (isValidFile && !exists) {
                             attachments.push({ url, fileName });
                         }
                     });
                 }
-                
+
                 if (deadline === 'نامشخص') {
                     const tables = document.querySelectorAll('.submissionstatustable, .generaltable');
-                    
+
                     for (const table of tables) {
                         const rows = table.querySelectorAll('tr');
-                        
+
                         for (const row of rows) {
                             const cells = row.querySelectorAll('td, th');
-                            
+
                             for (let i = 0; i < cells.length - 1; i++) {
                                 const cellText = cells[i].textContent.trim();
-                                
+
                                 if (cellText.includes('مهلت') ||
                                     cellText.includes('Due date') ||
                                     cellText.includes('تاریخ') ||
                                     cellText.toLowerCase().includes('deadline')) {
-                                    
+
                                     deadline = cells[i + 1].textContent.trim();
                                     break;
                                 }
                             }
-                            
+
                             if (deadline !== 'نامشخص') break;
                         }
-                        
+
                         if (deadline !== 'نامشخص') break;
                     }
                 }
@@ -765,11 +785,11 @@ class VUMonitor {
                 return false;
             }
             console.log(`📥 Downloading file: ${fileName}`);
-            
+
             const cookies = await this.page.cookies();
             const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
             const userAgent = await this.page.evaluate(() => navigator.userAgent);
-            
+
             const response = await axios.get(fileUrl, {
                 headers: {
                     'Cookie': cookieString,
@@ -784,24 +804,24 @@ class VUMonitor {
                 maxBodyLength: Infinity,
                 validateStatus: (status) => status === 200
             });
-            
+
             const buffer = Buffer.from(response.data);
             const contentType = response.headers['content-type'] || '';
             console.log(`📄 Content-Type: ${contentType}`);
             console.log(`📡 Response status: ${response.status}`);
-            
+
             if (contentType.includes('text/html')) {
                 const bodyText = buffer.toString('utf8').substring(0, 500);
                 console.log(`⚠️ Received HTML instead of file: ${bodyText.substring(0, 200)}...`);
                 throw new Error('Received HTML page instead of file - session may have expired');
             }
-            
+
             if (buffer.length < 100) {
                 throw new Error('Downloaded content too small - likely an error');
             }
-            
+
             console.log(`✅ Downloaded file size: ${(buffer.length / 1024 / 1024).toFixed(2)} MB`);
-            
+
             const normalizeDuplicateExtension = (name) => {
                 let n = (name || '').trim();
                 n = n.normalize('NFC').replace(/[\u200B-\u200D\uFEFF]/g, '');
@@ -811,7 +831,7 @@ class VUMonitor {
                 const parts = n.split('.');
                 if (parts.length <= 2) return n;
                 const ext = parts[parts.length - 1].toLowerCase();
-                const commonExts = new Set(['pdf','doc','docx','xls','xlsx','ppt','pptx','jpg','jpeg','png','txt','zip','rar']);
+                const commonExts = new Set(['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'jpg', 'jpeg', 'png', 'txt', 'zip', 'rar']);
                 const target = commonExts.has(ext) ? ext : ext;
                 let i = parts.length - 2;
                 while (i >= 1) {
@@ -824,7 +844,7 @@ class VUMonitor {
                 return parts.join('.');
             };
             fileName = normalizeDuplicateExtension(fileName);
-            
+
             const filesDir = path.join(process.cwd(), 'files');
             if (!fsSync.existsSync(filesDir)) {
                 fsSync.mkdirSync(filesDir, { recursive: true });
@@ -832,17 +852,17 @@ class VUMonitor {
             const savedFilePath = path.join(filesDir, fileName);
             fsSync.writeFileSync(savedFilePath, buffer);
             console.log(`💾 File saved to: ${savedFilePath}`);
-            
+
             console.log(`📤 Sending file to Telegram: ${fileName} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
-            
+
             const sendOptions = {
                 caption: `📎 ${fileName}`
             };
-            
+
             if (CONFIG.telegram.topicId) {
                 sendOptions.message_thread_id = CONFIG.telegram.topicId;
             }
-            
+
             if (buffer.length > 50 * 1024 * 1024) {
                 console.log(`⚠️ File too large (${(buffer.length / 1024 / 1024).toFixed(2)} MB), sending link only`);
                 await this.sendTelegramMessage(`📎 فایل خیلی بزرگ است (${(buffer.length / 1024 / 1024).toFixed(2)} MB)\n${fileName}\n🔗 ${fileUrl}`);
@@ -851,27 +871,27 @@ class VUMonitor {
                     filename: fileName
                 });
             }
-            
+
             this.courseData[courseId].sentFiles[fileUrl] = {
                 sent: true,
                 fileName: fileName,
                 filePath: savedFilePath,
                 sentAt: new Date().toISOString()
             };
-            
+
             await this.saveData();
-            
+
             console.log(`✅ File sent: ${fileName}`);
             return true;
         } catch (error) {
             console.error(`❌ Error downloading/sending file ${fileName}:`, error.message);
-            
+
             try {
                 await this.sendTelegramMessage(`⚠️ خطا در دانلود فایل\n📎 ${fileName}\n🔗 ${fileUrl}`);
             } catch (telegramError) {
                 console.error('Failed to send error message:', telegramError.message);
             }
-            
+
             return false;
         }
     }
@@ -885,7 +905,7 @@ class VUMonitor {
         };
         for (const [sectionName, activities] of Object.entries(newSections)) {
             const oldActivities = oldSections[sectionName] || [];
-            
+
             for (const activity of activities) {
                 const exists = oldActivities.find(a =>
                     a.name === activity.name && a.url === activity.url
@@ -917,7 +937,7 @@ class VUMonitor {
     async sendOrUpdateCourseOverview(courseId, courseName, courseUrl, allSections) {
         let message = `🎓 <b>${courseName}</b>\n`;
         message += `🔗 <a href="${courseUrl}">لینک درس</a>\n\n`;
-        
+
         let sectionsMsg = '';
         for (const [sectionName, activities] of Object.entries(allSections)) {
             let sectionMsg = `📍 <b>${sectionName}</b>\n`;
@@ -936,18 +956,18 @@ class VUMonitor {
             }
         }
         message += sectionsMsg;
-        
+
         if (sectionsMsg.trim() === '') {
             message += `📭 هنوز محتوایی اضافه نشده است.\n`;
         }
-        
+
         message += `━━━━━━━━━━━━━━━━━\n`;
-        
+
         const now = new Date();
         const persianDate = now.toLocaleDateString('fa-IR', { timeZone: 'Asia/Tehran' });
         const persianTime = now.toLocaleTimeString('fa-IR', { timeZone: 'Asia/Tehran', hour12: false });
         const dateTimeStr = `${persianDate}, ${persianTime}`;
-        
+
         const englishDateTime = dateTimeStr
             .replace(/۰/g, '0')
             .replace(/۱/g, '1')
@@ -959,9 +979,9 @@ class VUMonitor {
             .replace(/۷/g, '7')
             .replace(/۸/g, '8')
             .replace(/۹/g, '9');
-        
+
         message += `🕐 ${englishDateTime}`;
-        
+
         try {
             if (this.courseMessageIds[courseId]) {
                 const editOptions = {
@@ -970,11 +990,11 @@ class VUMonitor {
                     parse_mode: 'HTML',
                     disable_web_page_preview: true
                 };
-                
+
                 if (CONFIG.telegram.topicId) {
                     editOptions.message_thread_id = CONFIG.telegram.topicId;
                 }
-                
+
                 await bot.editMessageText(message, editOptions);
                 console.log(`✏️ Updated overview message for course ${courseId}`);
             } else {
@@ -982,11 +1002,11 @@ class VUMonitor {
                     parse_mode: 'HTML',
                     disable_web_page_preview: true
                 };
-                
+
                 if (CONFIG.telegram.topicId) {
                     sendOptions.message_thread_id = CONFIG.telegram.topicId;
                 }
-                
+
                 const sentMsg = await bot.sendMessage(CONFIG.telegram.chatId, message, sendOptions);
                 this.courseMessageIds[courseId] = sentMsg.message_id;
                 console.log(`📤 Sent new overview message for course ${courseId}`);
@@ -998,11 +1018,11 @@ class VUMonitor {
                     parse_mode: 'HTML',
                     disable_web_page_preview: true
                 };
-                
+
                 if (CONFIG.telegram.topicId) {
                     sendOptions.message_thread_id = CONFIG.telegram.topicId;
                 }
-                
+
                 const sentMsg = await bot.sendMessage(CONFIG.telegram.chatId, message, sendOptions);
                 this.courseMessageIds[courseId] = sentMsg.message_id;
             }
@@ -1010,16 +1030,16 @@ class VUMonitor {
     }
     async sendOrUpdateDeadlineOverview() {
         console.log('⏰ Updating deadline overview message...');
-        
+
         const allDeadlines = [];
-        
+
         for (const [courseId, course] of Object.entries(this.courseData)) {
             const assignments = course.assignments || {};
-            
+
             for (const [url, details] of Object.entries(assignments)) {
                 let activityName = 'Unknown';
                 let activityType = 'assign';
-                
+
                 for (const [sectionName, activities] of Object.entries(course.sections || {})) {
                     const activity = activities.find(a => a.url === url);
                     if (activity) {
@@ -1028,7 +1048,7 @@ class VUMonitor {
                         break;
                     }
                 }
-                
+
                 const isQuiz = activityType === 'quiz' || activityType === 'mod_quiz';
                 const deadlineField = isQuiz ? 'closed' : 'deadline';
                 if (details.opened && details.opened !== 'نامشخص') {
@@ -1062,15 +1082,15 @@ class VUMonitor {
                 }
             }
         }
-        
+
         allDeadlines.sort((a, b) => {
             if (a.dateInfo.daysRemaining === null) return 1;
             if (b.dateInfo.daysRemaining === null) return -1;
             return a.dateInfo.daysRemaining - b.dateInfo.daysRemaining;
         });
-        
+
         let message = '📃 <b>لیست رویداد ها</b>\n\n';
-        
+
         if (allDeadlines.length === 0) {
             message += '✅ هیچ تکلیف یا آزمون فعالی وجود ندارد!\n\n';
         } else {
@@ -1081,7 +1101,7 @@ class VUMonitor {
                 }
                 byCourse[item.courseName].push(item);
             }
-            
+
             for (const [courseName, items] of Object.entries(byCourse)) {
                 message += `📚 <b>${courseName}</b>\n\n`;
                 for (const item of items) {
@@ -1111,12 +1131,12 @@ class VUMonitor {
                 message += '━━━━━━━━━━━━━━━━━\n\n';
             }
         }
-        
+
         const now = new Date();
         const persianDate = now.toLocaleDateString('fa-IR', { timeZone: 'Asia/Tehran' });
         const persianTime = now.toLocaleTimeString('fa-IR', { timeZone: 'Asia/Tehran', hour12: false });
         const dateTimeStr = `${persianDate}, ${persianTime}`;
-        
+
         const englishDateTime = dateTimeStr
             .replace(/۰/g, '0')
             .replace(/۱/g, '1')
@@ -1128,9 +1148,9 @@ class VUMonitor {
             .replace(/۷/g, '7')
             .replace(/۸/g, '8')
             .replace(/۹/g, '9');
-        
+
         message += `🕐 آخرین به‌روزرسانی: ${englishDateTime}`;
-        
+
         try {
             if (this.deadlineMessageId) {
                 const editOptions = {
@@ -1139,11 +1159,11 @@ class VUMonitor {
                     parse_mode: 'HTML',
                     disable_web_page_preview: true
                 };
-                
+
                 if (CONFIG.telegram.topicId) {
                     editOptions.message_thread_id = CONFIG.telegram.topicId;
                 }
-                
+
                 await bot.editMessageText(message, editOptions);
                 console.log('✏️ Updated deadline overview message');
             } else {
@@ -1151,11 +1171,11 @@ class VUMonitor {
                     parse_mode: 'HTML',
                     disable_web_page_preview: true
                 };
-                
+
                 if (CONFIG.telegram.topicId) {
                     sendOptions.message_thread_id = CONFIG.telegram.topicId;
                 }
-                
+
                 const sentMsg = await bot.sendMessage(CONFIG.telegram.chatId, message, sendOptions);
                 this.deadlineMessageId = sentMsg.message_id;
                 await fs.writeFile('deadline_message_id.json', JSON.stringify({ messageId: this.deadlineMessageId }, null, 2));
@@ -1168,11 +1188,11 @@ class VUMonitor {
                     parse_mode: 'HTML',
                     disable_web_page_preview: true
                 };
-                
+
                 if (CONFIG.telegram.topicId) {
                     sendOptions.message_thread_id = CONFIG.telegram.topicId;
                 }
-                
+
                 const sentMsg = await bot.sendMessage(CONFIG.telegram.chatId, message, sendOptions);
                 this.deadlineMessageId = sentMsg.message_id;
                 await fs.writeFile('deadline_message_id.json', JSON.stringify({ messageId: this.deadlineMessageId }, null, 2));
@@ -1185,7 +1205,7 @@ class VUMonitor {
                 const activityType = item.activity.type;
                 let updateMessage = '';
                 let hasUpdate = false;
-                
+
                 if (activityType === 'assign' || activityType === 'mod_assign') {
                     const newDetails = await this.extractAssignmentDetails(item.activity.url);
                     if (!newDetails || newDetails.success === false) {
@@ -1193,7 +1213,7 @@ class VUMonitor {
                         continue;
                     }
                     const oldDetails = item.oldDetails;
-                    
+
                     let isExpired = false;
                     if (newDetails.deadline !== 'نامشخص') {
                         const newDeadlineInfo = this.formatPersianDate(newDetails.deadline);
@@ -1207,7 +1227,7 @@ class VUMonitor {
                         await this.saveData();
                         continue;
                     }
-                    
+
                     const openedChanged = newDetails.opened !== oldDetails.opened;
                     let deadlineChanged = newDetails.deadline !== oldDetails.deadline;
                     let oldDeadlineInfo = null;
@@ -1268,10 +1288,10 @@ class VUMonitor {
                             }
                         }
                     }
-                    
+
                     const oldAttachmentUrls = (oldDetails.attachments || []).map(a => a.url).sort();
                     const newAttachmentUrls = (newDetails.attachments || []).map(a => a.url).sort();
-                    
+
                     if (JSON.stringify(oldAttachmentUrls) !== JSON.stringify(newAttachmentUrls)) {
                         if (!hasUpdate) {
                             updateMessage = `🔄 <b>تغییر در فایل‌های تمرین</b>\n\n`;
@@ -1279,22 +1299,22 @@ class VUMonitor {
                             updateMessage += `📝 ${item.activity.name}\n\n`;
                         }
                         hasUpdate = true;
-                        
+
                         const addedFiles = newDetails.attachments.filter(newAtt =>
                             !oldAttachmentUrls.includes(newAtt.url)
                         );
-                        
+
                         const removedFiles = oldDetails.attachments.filter(oldAtt =>
                             !newAttachmentUrls.includes(oldAtt.url)
                         );
-                        
+
                         if (addedFiles.length > 0) {
                             updateMessage += `\n➕ <b>فایل‌های جدید اضافه شده:</b>\n`;
                             addedFiles.forEach(att => {
                                 updateMessage += ` 📄 ${att.fileName}\n`;
                             });
                         }
-                        
+
                         if (removedFiles.length > 0) {
                             const receivedNoAttachmentData = (newDetails.attachments || []).length === 0 && (oldDetails.attachments || []).length > 0;
                             if (receivedNoAttachmentData) {
@@ -1307,7 +1327,7 @@ class VUMonitor {
                             }
                         }
                     }
-                    
+
                     if (hasUpdate) {
                         await this.sendTelegramMessage(updateMessage, {
                             reply_markup: {
@@ -1316,17 +1336,17 @@ class VUMonitor {
                                 ]]
                             }
                         });
-                        
+
                         const addedFiles = newDetails.attachments.filter(newAtt =>
                             !oldAttachmentUrls.includes(newAtt.url)
                         );
-                        
+
                         for (const att of addedFiles) {
                             await this.downloadAndSendFile(att.url, att.fileName, courseId);
                             await new Promise(r => setTimeout(r, 1000));
                         }
                     }
-                    
+
                     this.courseData[courseId].assignments[item.activity.url] = newDetails;
                     await this.saveData();
                 } else if (activityType === 'quiz' || activityType === 'mod_quiz') {
@@ -1336,7 +1356,7 @@ class VUMonitor {
                         continue;
                     }
                     const oldDetails = item.oldDetails;
-                    
+
                     let isExpired = false;
                     if (newDetails.closed !== 'نامشخص') {
                         const newClosedInfo = this.formatPersianDate(newDetails.closed);
@@ -1350,7 +1370,7 @@ class VUMonitor {
                         await this.saveData();
                         continue;
                     }
-                    
+
                     const openedChanged = newDetails.opened !== oldDetails.opened;
                     let closedChanged = newDetails.closed !== oldDetails.closed;
                     let oldClosedInfo = null;
@@ -1411,7 +1431,7 @@ class VUMonitor {
                             }
                         }
                     }
-                    
+
                     if (hasUpdate) {
                         await this.sendTelegramMessage(updateMessage, {
                             reply_markup: {
@@ -1421,7 +1441,7 @@ class VUMonitor {
                             }
                         });
                     }
-                    
+
                     this.courseData[courseId].assignments[item.activity.url] = newDetails;
                     await this.saveData();
                 }
@@ -1433,25 +1453,25 @@ class VUMonitor {
     async notifyNewActivities(courseId, courseName, changes) {
         for (const item of changes.newItems) {
             const activityType = item.activity.type;
-            
+
             if (activityType === 'assign' || activityType === 'mod_assign') {
                 if (this.courseData[courseId].sentNotifications[item.activity.url]) {
                     console.log(`📭 Notification already sent for: ${item.activity.name}`);
                     continue;
                 }
-                
+
                 let message = `🆕 <b>تکلیف جدید</b>\n\n`;
                 message += `🎓 درس: ${courseName}\n`;
                 message += `📍 بخش: ${item.section}\n\n`;
                 message += `📝 ${item.activity.name}\n\n`;
-                
+
                 try {
                     let details = await this.extractAssignmentDetails(item.activity.url);
                     if (!details || details.success === false) {
                         console.log(`⚠️ Couldn't fetch assignment details for ${item.activity.name} — sending basic notification and skipping attachments`);
                         details = { opened: 'نامشخص', deadline: 'نامشخص', attachments: [] };
                     }
-                    
+
                     let isLastDay = false;
                     let isExpired = false;
                     if (details.deadline && details.deadline !== 'نامشخص') {
@@ -1470,23 +1490,23 @@ class VUMonitor {
                         await this.saveData();
                         continue;
                     }
-                    
+
                     if (isLastDay) {
                         message = `⏰ <b>یادآوری تکلیف</b>\n\n`;
                         message += `🎓 درس: ${courseName}\n`;
                         message += `📍 بخش: ${item.section}\n\n`;
                         message += `📝 ${item.activity.name}\n\n`;
                     }
-                    
+
                     if (details.opened && details.opened !== 'نامشخص') {
                         const openedInfo = this.formatPersianDate(details.opened);
                         message += `📅 باز شده: ${openedInfo.formatted}\n`;
                     }
-                    
+
                     if (details.deadline && details.deadline !== 'نامشخص') {
                         const dateInfo = this.formatPersianDate(details.deadline);
                         message += `⏰ مهلت: ${dateInfo.formatted}\n`;
-                        
+
                         if (dateInfo.daysRemaining !== null) {
                             if (dateInfo.daysRemaining < 0) {
                                 message += `❌ <b>مهلت گذشته است!</b> (${Math.abs(dateInfo.daysRemaining)} روز پیش)\n`;
@@ -1501,14 +1521,14 @@ class VUMonitor {
                             }
                         }
                     }
-                    
+
                     if (!isLastDay && details.attachments && details.attachments.length > 0) {
                         message += `\n📎 <b>فایل‌های ضمیمه:</b>\n`;
                         details.attachments.forEach(att => {
                             message += `📄 ${att.fileName}\n`;
                         });
                     }
-                    
+
                     await this.sendTelegramMessage(message, {
                         reply_markup: {
                             inline_keyboard: [[
@@ -1516,10 +1536,10 @@ class VUMonitor {
                             ]]
                         }
                     });
-                    
+
                     if (!isLastDay && details.attachments && details.attachments.length > 0) {
                         console.log(`📎 Found ${details.attachments.length} attachment(s) for assignment`);
-                        
+
                         for (const att of details.attachments) {
                             await this.downloadAndSendFile(att.url, att.fileName, courseId);
                             await new Promise(r => setTimeout(r, 1000));
@@ -1527,17 +1547,17 @@ class VUMonitor {
                     } else if (isLastDay) {
                         console.log(`📅 Last day - skipping file attachments for: ${item.activity.name}`);
                     }
-                    
+
                     this.courseData[courseId].assignments[item.activity.url] = details;
-                    
+
                     this.courseData[courseId].sentNotifications[item.activity.url] = {
                         sent: true,
                         sentAt: new Date().toISOString(),
                         activityName: item.activity.name
                     };
-                    
+
                     await this.saveData();
-                    
+
                 } catch (error) {
                     console.error('Error getting assignment details:', error.message);
                     if (!message.includes('مهلت:')) {
@@ -1556,19 +1576,19 @@ class VUMonitor {
                     console.log(`📭 Notification already sent for: ${item.activity.name}`);
                     continue;
                 }
-                
+
                 let message = `🆕 <b>آزمون جدید</b>\n\n`;
                 message += `🎓 درس: ${courseName}\n`;
                 message += `📍 بخش: ${item.section}\n\n`;
                 message += `❓ ${item.activity.name}\n\n`;
-                
+
                 try {
                     let details = await this.extractQuizDetails(item.activity.url);
                     if (!details || details.success === false) {
                         console.log(`⚠️ Couldn't fetch quiz details for ${item.activity.name} — sending basic notification`);
                         details = { opened: 'نامشخص', closed: 'نامشخص' };
                     }
-                    
+
                     let isExpired = false;
                     if (details.closed && details.closed !== 'نامشخص') {
                         const closedCheck = this.formatPersianDate(details.closed);
@@ -1582,16 +1602,16 @@ class VUMonitor {
                         await this.saveData();
                         continue;
                     }
-                    
+
                     if (details.opened && details.opened !== 'نامشخص') {
                         const openedInfo = this.formatPersianDate(details.opened);
                         message += `📅 باز شده: ${openedInfo.formatted}\n`;
                     }
-                    
+
                     if (details.closed && details.closed !== 'نامشخص') {
                         const dateInfo = this.formatPersianDate(details.closed);
                         message += `⏰ بسته می‌شود: ${dateInfo.formatted}\n`;
-                        
+
                         if (dateInfo.daysRemaining !== null) {
                             if (dateInfo.daysRemaining === 0) {
                                 message += `🔴 <b>امروز آخرین فرصت است!</b>\n`;
@@ -1604,7 +1624,7 @@ class VUMonitor {
                             }
                         }
                     }
-                    
+
                     await this.sendTelegramMessage(message, {
                         reply_markup: {
                             inline_keyboard: [[
@@ -1612,17 +1632,17 @@ class VUMonitor {
                             ]]
                         }
                     });
-                    
+
                     this.courseData[courseId].sentNotifications[item.activity.url] = {
                         sent: true,
                         sentAt: new Date().toISOString(),
                         activityName: item.activity.name
                     };
-                    
+
                     this.courseData[courseId].assignments[item.activity.url] = details;
-                    
+
                     await this.saveData();
-                    
+
                 } catch (error) {
                     console.error('Error getting quiz details:', error.message);
                     await this.sendTelegramMessage(message, {
@@ -1632,13 +1652,13 @@ class VUMonitor {
                             ]]
                         }
                     });
-                    
+
                     this.courseData[courseId].sentNotifications[item.activity.url] = {
                         sent: true,
                         sentAt: new Date().toISOString(),
                         activityName: item.activity.name
                     };
-                    
+
                     await this.saveData();
                 }
             }
@@ -1646,12 +1666,12 @@ class VUMonitor {
     }
     buildCourseMessage(course, item) {
         const emoji = this.getEmoji(item.activity.type);
-        
+
         let message = `🎓 درس: ${course.name}\n\n`;
         message += `📍 بخش: ${item.section}\n\n`;
         message += `${emoji} ${item.activity.name}\n\n`;
         message += `🔗 لینک: ${item.activity.url}`;
-        
+
         return message;
     }
     getEmoji(activityType) {
@@ -1665,7 +1685,7 @@ class VUMonitor {
             'folder': '📂',
             'label': '🏷️'
         };
-        
+
         return emojiMap[activityType] || '📌';
     }
     convertToShamsi(gregorianDate) {
@@ -1687,7 +1707,7 @@ class VUMonitor {
             5: 'جمعه',
             6: 'شنبه'
         };
-        
+
         return persianDays[dayNumber] || '';
     }
     getPersianMonthName(monthNumber) {
@@ -1705,7 +1725,7 @@ class VUMonitor {
             11: 'بهمن',
             12: 'اسفند'
         };
-        
+
         return persianMonths[monthNumber] || '';
     }
     formatPersianDate(deadlineText) {
@@ -1729,13 +1749,13 @@ class VUMonitor {
                 let hours = parseInt(timeMatch[1]);
                 const minutes = timeMatch[2];
                 const period = timeMatch[3].toUpperCase();
-                
+
                 if (period === 'PM' && hours !== 12) {
                     hours += 12;
                 } else if (period === 'AM' && hours === 12) {
                     hours = 0;
                 }
-                
+
                 time24 = `${hours.toString().padStart(2, '0')}:${minutes}`;
             }
             const gregorianDate = `${year}-${month}-${day.padStart(2, '0')}`;
@@ -1815,11 +1835,11 @@ class VUMonitor {
                 disable_web_page_preview: true,
                 ...options
             };
-            
+
             if (CONFIG.telegram.topicId) {
                 sendOptions.message_thread_id = CONFIG.telegram.topicId;
             }
-            
+
             await bot.sendMessage(CONFIG.telegram.chatId, message, sendOptions);
             console.log('✅ Telegram notification sent');
         } catch (error) {
@@ -1835,12 +1855,12 @@ class VUMonitor {
         for (const [sectionName, activities] of Object.entries(course.sections)) {
             if (activities.length > 0) {
                 message += `<b>${sectionName}</b>\n`;
-                
+
                 activities.forEach(activity => {
                     const emoji = this.getEmoji(activity.type);
                     message += `${emoji} ${activity.name}\n`;
                 });
-                
+
                 message += `\n`;
             }
         }
@@ -1848,95 +1868,95 @@ class VUMonitor {
     }
     async checkAndSendReminders() {
         console.log('⏰ Checking for assignment reminders...');
-        
+
         const now = new Date();
         const in24Hours = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-        
+
         for (const [courseId, course] of Object.entries(this.courseData)) {
             for (const [sectionName, activities] of Object.entries(course.sections)) {
                 for (const activity of activities) {
                     if (!['assign', 'mod_assign', 'quiz', 'mod_quiz'].includes(activity.type)) continue;
-                    
+
                     const isQuiz = activity.type === 'quiz' || activity.type === 'mod_quiz';
-                    
+
                     const reminderKey = `${courseId}_${activity.url}`;
-                    
+
                     if (this.sentReminders[reminderKey]) {
                         continue;
                     }
-                    
+
                     try {
                         const details = isQuiz ? await this.extractQuizDetails(activity.url) : await this.extractAssignmentDetails(activity.url);
                         const deadlineField = isQuiz ? 'closed' : 'deadline';
-                        
+
                         if (details[deadlineField] && details[deadlineField] !== 'نامشخص') {
                             const match = details[deadlineField].match(/(\d+)\s+(\w+)\s+(\d+)،\s*(.+)/);
                             if (!match) continue;
-                            
+
                             const day = match[1];
                             const monthName = match[2];
                             const year = match[3];
                             const time = match[4];
-                            
+
                             const months = {
                                 'January': '01', 'February': '02', 'March': '03', 'April': '04',
                                 'May': '05', 'June': '06', 'July': '07', 'August': '08',
                                 'September': '09', 'October': '10', 'November': '11', 'December': '12'
                             };
-                            
+
                             const month = months[monthName];
                             if (!month) continue;
-                            
+
                             const timeMatch = time.match(/(\d+):(\d+)\s*(AM|PM)/i);
                             let hours = 0;
                             let minutes = 0;
-                            
+
                             if (timeMatch) {
                                 hours = parseInt(timeMatch[1]);
                                 minutes = parseInt(timeMatch[2]);
                                 const period = timeMatch[3].toUpperCase();
-                                
+
                                 if (period === 'PM' && hours !== 12) {
                                     hours += 12;
                                 } else if (period === 'AM' && hours === 12) {
                                     hours = 0;
                                 }
                             }
-                            
+
                             const deadline = new Date(year, parseInt(month) - 1, parseInt(day), hours, minutes);
-                            
+
                             const hoursUntilDeadline = (deadline - now) / (1000 * 60 * 60);
-                            
+
                             if (hoursUntilDeadline <= 0) {
                                 console.log(`⏭️ Skipping reminder for ${activity.name} - deadline has passed`);
                                 continue;
                             }
-                            
+
                             if (hoursUntilDeadline > 0 && hoursUntilDeadline <= 24) {
                                 const lastDayReminderKey = `${courseId}_${activity.url}_lastday`;
-                                
+
                                 if (this.sentLastDayReminders[lastDayReminderKey]) {
                                     console.log(`📅 Last day reminder already sent for: ${activity.name}`);
                                     continue;
                                 }
-                                
+
                                 const dateInfo = this.formatPersianDate(details[deadlineField]);
-                                
+
                                 let message = `⏰ <b>یادآوری: مهلت ${isQuiz ? 'آزمون' : 'تکلیف'} رو به پایان است!</b>\n\n`;
                                 message += `🎓 درس: ${course.name}\n`;
                                 message += `📍 بخش: ${sectionName}\n\n`;
                                 message += `${isQuiz ? '❓' : '📝'} ${activity.name}\n\n`;
                                 message += `⏰ ${isQuiz ? 'بسته می‌شود' : 'مهلت'}: ${dateInfo.formatted}\n`;
-                                
+
                                 const hoursRemaining = Math.floor(hoursUntilDeadline);
                                 const minutesRemaining = Math.floor((hoursUntilDeadline - hoursRemaining) * 60);
-                                
+
                                 if (hoursRemaining === 0) {
                                     message += `🔴 <b>فقط ${minutesRemaining} دقیقه دیگر!</b>`;
                                 } else {
                                     message += `🔴 <b>فقط ${hoursRemaining} ساعت و ${minutesRemaining} دقیقه دیگر!</b>`;
                                 }
-                                
+
                                 await this.sendTelegramMessage(message, {
                                     reply_markup: {
                                         inline_keyboard: [[
@@ -1944,25 +1964,25 @@ class VUMonitor {
                                         ]]
                                     }
                                 });
-                                
+
                                 this.sentLastDayReminders[lastDayReminderKey] = {
                                     sentAt: now.toISOString(),
                                     deadline: deadline.toISOString(),
                                     courseName: course.name,
                                     activityName: activity.name
                                 };
-                                
+
                                 this.sentReminders[reminderKey] = {
                                     sentAt: now.toISOString(),
                                     deadline: deadline.toISOString(),
                                     courseName: course.name,
                                     activityName: activity.name
                                 };
-                                
+
                                 await this.saveData();
-                                
+
                                 console.log(`⏰ Sent last day reminder for: ${activity.name}`);
-                                
+
                                 await new Promise(r => setTimeout(r, 2000));
                             }
                         }
@@ -1972,7 +1992,7 @@ class VUMonitor {
                 }
             }
         }
-        
+
         console.log('✅ Reminder check completed');
     }
     async checkAllCourses() {
@@ -1993,10 +2013,10 @@ class VUMonitor {
                 console.log('🔧 Browser not healthy, reinitializing...');
                 await this.initialize();
             }
-            
+
             console.log('🔍 Checking if already logged in...');
             let needsLogin = true;
-            
+
             try {
                 const testUrl = CONFIG.vu.courseUrls[0];
                 await this.page.goto(testUrl, {
@@ -2004,10 +2024,10 @@ class VUMonitor {
                     timeout: 20000
                 });
                 await new Promise(r => setTimeout(r, 3000));
-                
+
                 const currentUrl = this.page.url();
                 console.log(`📍 Current URL: ${currentUrl}`);
-                
+
                 if (currentUrl.includes('oauth.um.ac.ir') || currentUrl.includes('login')) {
                     console.log('🔐 Session expired, login required');
                     needsLogin = true;
@@ -2024,7 +2044,7 @@ class VUMonitor {
                 await this.initialize();
                 needsLogin = true;
             }
-            
+
             if (needsLogin) {
                 await this.login();
             }
@@ -2083,15 +2103,15 @@ class VUMonitor {
                 }
             }
             console.log('\n✅ Check cycle completed\n');
-            
+
             await this.clearBrowserCache();
-            
+
             try {
                 await this.sendOrUpdateDeadlineOverview();
             } catch (err) {
                 console.error('Error updating deadline overview:', err.message);
             }
-            
+
             await this.checkAndSendReminders();
             if (this.isFirstRun) {
                 this.isFirstRun = false;
