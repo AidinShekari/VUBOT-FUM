@@ -1,0 +1,21 @@
+{
+  "name": "vu-monitor",
+  "version": "1.0.0",
+  "description": "VU Course Monitor with Telegram notifications",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "cheerio": "^1.2.0",
+    "cron": "^3.1.6",
+    "dotenv": "^16.3.1",
+    "input": "^1.0.1",
+    "moment-jalaali": "^0.10.4",
+    "node-telegram-bot-api": "^0.64.0",
+    "puppeteer": "^24.34.0",
+    "telegram": "^2.26.22",
+    "unbzip2-stream": "^1.4.3"
+  }
+}
