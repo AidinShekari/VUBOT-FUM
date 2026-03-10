@@ -803,6 +803,59 @@ class VUMonitor {
             return { success: false, error: error.message };
         }
     }
+    async extractResourceFileUrl(resourceUrl) {
+        try {
+            await this.page.goto(resourceUrl, {
+                waitUntil: 'domcontentloaded',
+                timeout: 60000
+            });
+            await new Promise(r => setTimeout(r, 3000));
+            
+            // Check if we were redirected directly to the file
+            const currentUrl = this.page.url();
+            if (currentUrl.includes('pluginfile.php')) {
+                const fileName = decodeURIComponent(currentUrl.split('/').pop().split('?')[0]);
+                return { url: currentUrl, fileName };
+            }
+            
+            // Extract file URL from resource page
+            const fileInfo = await this.page.evaluate(() => {
+                // Look for direct download link
+                const resourceLink = document.querySelector('.resourceworkaround a[href*="pluginfile.php"]') ||
+                                   document.querySelector('.resourcecontent a[href*="pluginfile.php"]') ||
+                                   document.querySelector('a[href*="pluginfile.php"]');
+                
+                if (resourceLink) {
+                    const url = resourceLink.href;
+                    const fileName = resourceLink.textContent.trim() || 
+                                   decodeURIComponent(url.split('/').pop().split('?')[0]);
+                    return { url, fileName };
+                }
+                
+                // Look for embedded object/iframe
+                const objectTag = document.querySelector('object[data*="pluginfile.php"]');
+                if (objectTag) {
+                    const url = objectTag.data;
+                    const fileName = decodeURIComponent(url.split('/').pop().split('?')[0]);
+                    return { url, fileName };
+                }
+                
+                const iframeTag = document.querySelector('iframe[src*="pluginfile.php"]');
+                if (iframeTag) {
+                    const url = iframeTag.src;
+                    const fileName = decodeURIComponent(url.split('/').pop().split('?')[0]);
+                    return { url, fileName };
+                }
+                
+                return null;
+            });
+            
+            return fileInfo;
+        } catch (error) {
+            console.error('Error extracting resource file URL:', error.message);
+            return null;
+        }
+    }
     async extractAssignmentDetails(assignmentUrl) {
         try {
             await this.page.goto(assignmentUrl, {
@@ -1917,6 +1970,101 @@ class VUMonitor {
                     
                     await this.saveData();
                 }
+            }
+            else if (activityType === 'resource' || activityType === 'mod_resource') {
+                if (this.courseData[courseId].sentNotifications[item.activity.url]) {
+                    console.log(`📭 Notification already sent for: ${item.activity.name}`);
+                    continue;
+                }
+                
+                let message = `🆕 <b>فایل جدید</b>\n\n`;
+                message += `🎓 درس: ${courseName}\n`;
+                message += `📍 بخش: ${item.section}\n\n`;
+                message += `📁 ${item.activity.name}\n`;
+                
+                try {
+                    // Extract file URL from resource page
+                    const fileInfo = await this.extractResourceFileUrl(item.activity.url);
+                    
+                    if (fileInfo && fileInfo.url) {
+                        console.log(`📥 Attempting to download resource file: ${fileInfo.fileName}`);
+                        
+                        const { buffer, contentType, statusCode } = await this.downloadWithSessionCookies(fileInfo.url);
+                        
+                        // Check if we got HTML instead of file
+                        if (contentType.includes('text/html')) {
+                            throw new Error('Received HTML instead of file');
+                        }
+                        
+                        const fileSizeMB = buffer.length / (1024 * 1024);
+                        console.log(`📄 File size: ${fileSizeMB.toFixed(2)} MB`);
+                        
+                        if (fileSizeMB <= 100) {
+                            // Send notification first
+                            await this.sendTelegramMessage(message, {
+                                chatIds: this.getCourseTargetChatIds(courseId)
+                            });
+                            
+                            // Send file as attachment
+                            const targetChatIds = this.getCourseTargetChatIds(courseId);
+                            for (const chatId of targetChatIds) {
+                                await this.sendDocumentViaApi({
+                                    chatId,
+                                    buffer,
+                                    fileName: fileInfo.fileName,
+                                    caption: `📎 ${fileInfo.fileName}`,
+                                    contentType
+                                });
+                            }
+                            console.log(`✅ File uploaded: ${fileInfo.fileName}`);
+                        } else {
+                            // File too large, just send link
+                            message += `🔗 ${item.activity.url}\n`;
+                            message += `⚠️ حجم فایل: ${fileSizeMB.toFixed(2)} MB (بیش از 100 مگابایت)\n`;
+                            
+                            await this.sendTelegramMessage(message, {
+                                chatIds: this.getCourseTargetChatIds(courseId),
+                                reply_markup: {
+                                    inline_keyboard: [[
+                                        { text: '🔗 دانلود فایل', url: item.activity.url }
+                                    ]]
+                                }
+                            });
+                        }
+                    } else {
+                        // Couldn't extract file URL, send link only
+                        message += `🔗 ${item.activity.url}\n`;
+                        await this.sendTelegramMessage(message, {
+                            chatIds: this.getCourseTargetChatIds(courseId),
+                            reply_markup: {
+                                inline_keyboard: [[
+                                    { text: '🔗 دانلود فایل', url: item.activity.url }
+                                ]]
+                            }
+                        });
+                    }
+                } catch (error) {
+                    console.error(`❌ Error downloading resource file: ${error.message}`);
+                    message += `🔗 ${item.activity.url}\n`;
+                    await this.sendTelegramMessage(message, {
+                        chatIds: this.getCourseTargetChatIds(courseId),
+                        reply_markup: {
+                            inline_keyboard: [[
+                                { text: '🔗 دانلود فایل', url: item.activity.url }
+                            ]]
+                        }
+                    });
+                }
+                
+                this.courseData[courseId].sentNotifications[item.activity.url] = {
+                    sent: true,
+                    sentAt: new Date().toISOString(),
+                    activityName: item.activity.name
+                };
+                
+                await this.saveData();
+                
+                console.log(`📁 Notified about new file: ${item.activity.name}`);
             }
         }
     }
