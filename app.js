@@ -106,6 +106,7 @@ if (CONFIG.httpProxy) {
 const bot = new TelegramBot(CONFIG.telegram.token, botOptions);
 let monitor = null;
 const DATA_FILE = 'course_data.json';
+const COURSE_DEADLINE_MESSAGE_IDS_FILE = 'course_deadline_message_ids.json';
 class VUMonitor {
     constructor() {
         this.browser = null;
@@ -114,6 +115,7 @@ class VUMonitor {
         this.cronJob = null;
         this.isFirstRun = false;
         this.courseMessageIds = {};
+        this.courseDeadlineMessageIds = {};
         this.sentReminders = {};
         this.sentLastDayReminders = {};
         this.deadlineMessageId = null;
@@ -169,6 +171,21 @@ class VUMonitor {
             }
         }
         this.courseMessageIds[courseId][key] = ids;
+    }
+    getStoredCourseDeadlineMessageId(courseId, chatId) {
+        const stored = this.courseDeadlineMessageIds[courseId];
+        const key = String(chatId);
+        if (stored && typeof stored === 'object' && stored[key]) {
+            return stored[key];
+        }
+        return null;
+    }
+    setStoredCourseDeadlineMessageId(courseId, chatId, messageId) {
+        const key = String(chatId);
+        if (!this.courseDeadlineMessageIds[courseId] || typeof this.courseDeadlineMessageIds[courseId] !== 'object') {
+            this.courseDeadlineMessageIds[courseId] = {};
+        }
+        this.courseDeadlineMessageIds[courseId][key] = messageId;
     }
     findChromePath() {
         const possiblePaths = process.platform === 'win32' ? [
@@ -285,6 +302,14 @@ class VUMonitor {
             this.courseMessageIds = {};
         }
         try {
+            const courseDeadlineMsgData = await fs.readFile(COURSE_DEADLINE_MESSAGE_IDS_FILE, 'utf8');
+            this.courseDeadlineMessageIds = JSON.parse(courseDeadlineMsgData);
+            console.log('📃 Loaded course deadline message IDs');
+        } catch (error) {
+            console.log('📃 No course deadline message IDs found');
+            this.courseDeadlineMessageIds = {};
+        }
+        try {
             const deadlineMsgData = await fs.readFile('deadline_message_id.json', 'utf8');
             this.deadlineMessageId = JSON.parse(deadlineMsgData).messageId;
             console.log('⏰ Loaded deadline message ID');
@@ -316,6 +341,7 @@ class VUMonitor {
         this.cleanExpiredReminders();
         await fs.writeFile(DATA_FILE, JSON.stringify(this.courseData, null, 2));
         await fs.writeFile('message_ids.json', JSON.stringify(this.courseMessageIds, null, 2));
+        await fs.writeFile(COURSE_DEADLINE_MESSAGE_IDS_FILE, JSON.stringify(this.courseDeadlineMessageIds, null, 2));
         await fs.writeFile('reminders.json', JSON.stringify(this.sentReminders, null, 2));
         await fs.writeFile('last_day_reminders.json', JSON.stringify(this.sentLastDayReminders, null, 2));
         if (this.deadlineMessageId) {
@@ -1657,6 +1683,62 @@ class VUMonitor {
             }
         }
     }
+    async sendOrUpdateCourseDeadlineOverview(courseId, course = this.courseData[courseId]) {
+        if (!course) {
+            return;
+        }
+
+        const extraChatId = this.getCourseExtraChatId(courseId, course.url);
+        if (!extraChatId || String(extraChatId) === String(CONFIG.telegram.globalChatId)) {
+            return;
+        }
+
+        console.log(`📃 Updating deadline overview for course ${courseId} in chat ${extraChatId}...`);
+
+        const courseDeadlines = this.collectCourseDeadlineItems(courseId, course);
+        let message = `📃 <b>لیست رویداد های ${course.name}</b>\n`;
+        if (course.url) {
+            message += `🔗 <a href="${course.url}">لینک درس</a>\n\n`;
+        } else {
+            message += '\n';
+        }
+        message += this.renderDeadlineItems(courseDeadlines, {
+            emptyMessage: '✅ فعلا رویداد فعالی برای این درس وجود ندارد.\n\n'
+        });
+        message += `${this.getUpdateScheduleNotice()}\n`;
+        message += `🕐 آخرین به‌روزرسانی (UTC): ${this.getShamsiUtcTimestamp()}`;
+
+        const formattedMessage = this.toMarkdown(message);
+        const messageId = this.getStoredCourseDeadlineMessageId(courseId, extraChatId);
+        const sendOptions = this.getChatScopedOptions({
+            parse_mode: 'Markdown',
+            disable_web_page_preview: true
+        }, extraChatId);
+
+        try {
+            if (messageId) {
+                await bot.editMessageText(formattedMessage, {
+                    chat_id: extraChatId,
+                    message_id: messageId,
+                    ...sendOptions
+                });
+                console.log(`✏️ Updated course deadline overview for ${courseId}`);
+                return;
+            }
+
+            const sentMsg = await bot.sendMessage(extraChatId, formattedMessage, sendOptions);
+            this.setStoredCourseDeadlineMessageId(courseId, extraChatId, sentMsg.message_id);
+            await fs.writeFile(COURSE_DEADLINE_MESSAGE_IDS_FILE, JSON.stringify(this.courseDeadlineMessageIds, null, 2));
+            console.log(`📤 Sent new course deadline overview for ${courseId}`);
+        } catch (error) {
+            console.error(`Error sending/updating course deadline overview for ${courseId}:`, error.message);
+            if (error.message.includes('message to edit not found') || error.message.includes('message_id_invalid')) {
+                const sentMsg = await bot.sendMessage(extraChatId, formattedMessage, sendOptions);
+                this.setStoredCourseDeadlineMessageId(courseId, extraChatId, sentMsg.message_id);
+                await fs.writeFile(COURSE_DEADLINE_MESSAGE_IDS_FILE, JSON.stringify(this.courseDeadlineMessageIds, null, 2));
+            }
+        }
+    }
     async checkForUpdates(courseId, courseName, updatedItems) {
         for (const item of updatedItems) {
             try {
@@ -2800,6 +2882,13 @@ class VUMonitor {
                 await this.sendOrUpdateDeadlineOverview();
             } catch (err) {
                 console.error('Error updating deadline overview:', err.message);
+            }
+            for (const [courseId, course] of Object.entries(this.courseData)) {
+                try {
+                    await this.sendOrUpdateCourseDeadlineOverview(courseId, course);
+                } catch (err) {
+                    console.error(`Error updating course deadline overview for ${courseId}:`, err.message);
+                }
             }
             
             await this.checkAndSendReminders();
