@@ -90,7 +90,8 @@ const CONFIG = {
     checkInterval: parseInt(process.env.CHECK_INTERVAL) || 5,
     debug: process.env.DEBUG_MODE === 'true' || false,
     chromePath: process.env.CHROME_PATH || null,
-    httpProxy: process.env.HTTP_PROXY || null
+    httpProxy: process.env.HTTP_PROXY || null,
+    quietHoursEnabled: false  // true = quiet hours فعال، false = غیرفعال
 };
 if (CONFIG.httpProxy) {
     console.log('Using Proxy:', CONFIG.httpProxy);
@@ -805,6 +806,14 @@ class VUMonitor {
     }
     async extractResourceFileUrl(resourceUrl) {
         try {
+            // Try to download directly from resource URL by following redirects with cookies
+            // Moodle's mod/resource/view.php redirects to the actual pluginfile.php
+            const result = await this.followRedirectsForFileUrl(resourceUrl);
+            if (result && result.url) {
+                return result;
+            }
+            
+            // Fallback: use Puppeteer to navigate and extract URL
             await this.page.goto(resourceUrl, {
                 waitUntil: 'domcontentloaded',
                 timeout: 60000
@@ -855,6 +864,106 @@ class VUMonitor {
             console.error('Error extracting resource file URL:', error.message);
             return null;
         }
+    }
+    
+    async followRedirectsForFileUrl(startUrl, redirectsLeft = 10) {
+        // Follow redirects with session cookies using GET to find the final file URL
+        // Moodle redirects resource/view.php to pluginfile.php
+        if (redirectsLeft < 0) {
+            return null;
+        }
+
+        const cookies = await this.page.cookies();
+        const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+        const userAgent = await this.page.evaluate(() => navigator.userAgent);
+
+        const urlObj = new URL(startUrl);
+        const client = urlObj.protocol === 'https:' ? https : http;
+
+        return await new Promise((resolve) => {
+            const req = client.request(urlObj, {
+                method: 'GET',
+                headers: {
+                    'Cookie': cookieHeader,
+                    'User-Agent': userAgent,
+                    'Accept': '*/*'
+                },
+                timeout: 30000
+            }, (res) => {
+                const statusCode = res.statusCode || 0;
+                const headers = res.headers || {};
+
+                // Handle redirects
+                if ([301, 302, 303, 307, 308].includes(statusCode) && headers.location) {
+                    res.resume(); // Discard body
+                    const redirectUrl = new URL(headers.location, startUrl).toString();
+                    console.log(`↪️ Redirect ${statusCode}: ${redirectUrl}`);
+                    this.followRedirectsForFileUrl(redirectUrl, redirectsLeft - 1)
+                        .then(resolve)
+                        .catch(() => resolve(null));
+                    return;
+                }
+
+                if (statusCode >= 200 && statusCode < 300) {
+                    const contentType = (headers['content-type'] || '').toString();
+                    const contentDisposition = (headers['content-disposition'] || '').toString();
+                    
+                    // Check if this is a file (not HTML)
+                    if (!contentType.includes('text/html')) {
+                        let fileName = '';
+                        
+                        // Try to get filename from Content-Disposition header
+                        // Format: attachment; filename="file.pdf" or filename*=UTF-8''file.pdf
+                        const filenameMatch = contentDisposition.match(/filename[*]?=['"]?(?:UTF-8'')?([^'";]+)/i);
+                        if (filenameMatch) {
+                            fileName = decodeURIComponent(filenameMatch[1].trim());
+                        } else {
+                            // Extract from URL
+                            fileName = decodeURIComponent(startUrl.split('/').pop().split('?')[0]);
+                        }
+                        
+                        console.log(`✅ Found file: ${fileName} (${contentType})`);
+                        
+                        // Read the body since we need it
+                        const chunks = [];
+                        res.on('data', (chunk) => chunks.push(chunk));
+                        res.on('end', () => {
+                            resolve({ 
+                                url: startUrl, 
+                                fileName, 
+                                contentType,
+                                buffer: Buffer.concat(chunks)
+                            });
+                        });
+                        return;
+                    } else {
+                        // Got HTML - might be login page or error
+                        const chunks = [];
+                        res.on('data', (chunk) => chunks.push(chunk));
+                        res.on('end', () => {
+                            const html = Buffer.concat(chunks).toString('utf8');
+                            console.log(`⚠️ Got HTML response (first 200 chars): ${html.substring(0, 200)}`);
+                            resolve(null);
+                        });
+                        return;
+                    }
+                }
+                
+                res.resume();
+                console.log(`⚠️ Unexpected status ${statusCode} for ${startUrl}`);
+                resolve(null);
+            });
+
+            req.on('timeout', () => {
+                req.destroy();
+                resolve(null);
+            });
+            req.on('error', (err) => {
+                console.log(`⚠️ Request error: ${err.message}`);
+                resolve(null);
+            });
+            req.end();
+        });
     }
     async extractAssignmentDetails(assignmentUrl) {
         try {
@@ -1014,7 +1123,7 @@ class VUMonitor {
                 sendOptions.message_thread_id = CONFIG.telegram.topicId;
             }
             
-            if (buffer.length > 50 * 1024 * 1024) {
+            if (buffer.length > 5 * 1024 * 1024) {
                 console.log(`⚠️ File too large (${(buffer.length / 1024 / 1024).toFixed(2)} MB), sending link only`);
                 await this.sendTelegramMessage(`📎 فایل خیلی بزرگ است (${(buffer.length / 1024 / 1024).toFixed(2)} MB)\n${fileName}\n🔗 ${fileUrl}`, {
                     chatIds: this.getCourseTargetChatIds(courseId)
@@ -1259,7 +1368,15 @@ class VUMonitor {
         }
         
         message += `━━━━━━━━━━━━━━━━━\n`;
-        
+        message += `📃 <b>لیست رویداد ها</b>\n\n`;
+
+        const courseDeadlines = this.collectCourseDeadlineItems(courseId);
+        message += this.renderDeadlineItems(courseDeadlines, {
+            emptyMessage: '✅ فعلا رویداد فعالی برای این درس وجود ندارد.\n\n'
+        });
+
+        message += `━━━━━━━━━━━━━━━━━\n`;
+        message += `${this.getUpdateScheduleNotice()}\n`;
         message += `🕐 ${this.getShamsiUtcTimestamp()}`;
         const formattedMessage = this.toMarkdown(message);
         const messageParts = this.splitCourseOverviewMessage(formattedMessage);
@@ -1346,111 +1463,149 @@ class VUMonitor {
 
         return [part1, part2];
     }
+    collectCourseDeadlineItems(courseId, course = this.courseData[courseId]) {
+        if (!course) {
+            return [];
+        }
+
+        const items = [];
+        const assignments = course.assignments || {};
+
+        for (const [url, details] of Object.entries(assignments)) {
+            let activityName = 'Unknown';
+            let activityType = 'assign';
+
+            for (const activities of Object.values(course.sections || {})) {
+                const activity = activities.find(a => a.url === url);
+                if (activity) {
+                    activityName = activity.name;
+                    activityType = activity.type;
+                    break;
+                }
+            }
+
+            const isQuiz = activityType === 'quiz' || activityType === 'mod_quiz';
+            const deadlineField = isQuiz ? 'closed' : 'deadline';
+
+            if (details.opened && details.opened !== 'نامشخص') {
+                const openedInfo = this.formatPersianDate(details.opened);
+                if (openedInfo.daysRemaining !== null && openedInfo.daysRemaining > 0) {
+                    items.push({
+                        courseId,
+                        courseName: course.name,
+                        activityName,
+                        activityType,
+                        url,
+                        dateInfo: openedInfo,
+                        isQuiz,
+                        eventType: 'opened'
+                    });
+                }
+            }
+
+            if (details[deadlineField] && details[deadlineField] !== 'نامشخص') {
+                const dateInfo = this.formatPersianDate(details[deadlineField]);
+                if (dateInfo.daysRemaining === null || dateInfo.daysRemaining >= 0) {
+                    items.push({
+                        courseId,
+                        courseName: course.name,
+                        activityName,
+                        activityType,
+                        url,
+                        dateInfo,
+                        isQuiz,
+                        eventType: 'deadline'
+                    });
+                }
+            }
+        }
+
+        return this.sortDeadlineItems(items);
+    }
+    sortDeadlineItems(items) {
+        return items.sort((a, b) => {
+            if (a.dateInfo.daysRemaining === null) return 1;
+            if (b.dateInfo.daysRemaining === null) return -1;
+            return a.dateInfo.daysRemaining - b.dateInfo.daysRemaining;
+        });
+    }
+    renderDeadlineItems(items, options = {}) {
+        const {
+            groupByCourse = false,
+            emptyMessage = '✅ هیچ تکلیف یا آزمون فعالی وجود ندارد!\n\n'
+        } = options;
+
+        if (!items || items.length === 0) {
+            return emptyMessage;
+        }
+
+        let message = '';
+        const renderItem = (item) => {
+            const emoji = item.eventType === 'opened' ? '🔓' : (item.isQuiz ? '❓' : '📝');
+            const label = item.eventType === 'opened' ? 'باز شدن' : (item.isQuiz ? 'بسته می‌شود' : 'مهلت');
+            let itemMessage = `${emoji} <b>${item.activityName}</b>\n`;
+            itemMessage += `${label}: ${item.dateInfo.formatted}\n`;
+
+            const days = item.dateInfo.daysRemaining;
+            if (days === null) {
+                itemMessage += 'ℹ️ زمان نامشخص\n';
+            } else if (days < 0) {
+                itemMessage += '❌ <b>گذشته</b>\n';
+            } else if (days === 0) {
+                itemMessage += '🔴 <b>امروز</b>\n';
+            } else if (days === 1) {
+                itemMessage += '⚠️ <b>1 روز باقی مانده</b>\n';
+            } else if (days <= 3) {
+                itemMessage += `⚠️ ${days} روز دیگر\n`;
+            } else if (days <= 7) {
+                itemMessage += `🟡 ${days} روز دیگر\n`;
+            } else {
+                itemMessage += `✅ ${days} روز دیگر\n`;
+            }
+
+            return itemMessage + '\n';
+        };
+
+        if (groupByCourse) {
+            const byCourse = {};
+            for (const item of items) {
+                if (!byCourse[item.courseName]) {
+                    byCourse[item.courseName] = [];
+                }
+                byCourse[item.courseName].push(item);
+            }
+
+            for (const [courseName, courseItems] of Object.entries(byCourse)) {
+                message += `📚 <b>${courseName}</b>\n\n`;
+                for (const item of courseItems) {
+                    message += renderItem(item);
+                }
+                message += '━━━━━━━━━━━━━━━━━\n\n';
+            }
+
+            return message;
+        }
+
+        for (const item of items) {
+            message += renderItem(item);
+        }
+
+        return message;
+    }
     async sendOrUpdateDeadlineOverview() {
         console.log('⏰ Updating deadline overview message...');
         
         const allDeadlines = [];
         
         for (const [courseId, course] of Object.entries(this.courseData)) {
-            const assignments = course.assignments || {};
-            
-            for (const [url, details] of Object.entries(assignments)) {
-                let activityName = 'Unknown';
-                let activityType = 'assign';
-                
-                for (const [sectionName, activities] of Object.entries(course.sections || {})) {
-                    const activity = activities.find(a => a.url === url);
-                    if (activity) {
-                        activityName = activity.name;
-                        activityType = activity.type;
-                        break;
-                    }
-                }
-                
-                const isQuiz = activityType === 'quiz' || activityType === 'mod_quiz';
-                const deadlineField = isQuiz ? 'closed' : 'deadline';
-                if (details.opened && details.opened !== 'نامشخص') {
-                    const openedInfo = this.formatPersianDate(details.opened);
-                    // Only show "opened" event if it's in the future (not yet open)
-                    if (openedInfo.daysRemaining !== null && openedInfo.daysRemaining > 0) {
-                        allDeadlines.push({
-                            courseName: course.name,
-                            activityName,
-                            activityType,
-                            url,
-                            dateInfo: openedInfo,
-                            isQuiz,
-                            eventType: 'opened'
-                        });
-                    }
-                }
-                if (details[deadlineField] && details[deadlineField] !== 'نامشخص') {
-                    const dateInfo = this.formatPersianDate(details[deadlineField]);
-                    if (dateInfo.daysRemaining !== null && dateInfo.daysRemaining < 0) {
-                    } else {
-                        allDeadlines.push({
-                            courseName: course.name,
-                            activityName,
-                            activityType,
-                            url,
-                            dateInfo,
-                            isQuiz,
-                            eventType: 'deadline'
-                        });
-                    }
-                }
-            }
+            allDeadlines.push(...this.collectCourseDeadlineItems(courseId, course));
         }
-        
-        allDeadlines.sort((a, b) => {
-            if (a.dateInfo.daysRemaining === null) return 1;
-            if (b.dateInfo.daysRemaining === null) return -1;
-            return a.dateInfo.daysRemaining - b.dateInfo.daysRemaining;
-        });
-        
+
+        this.sortDeadlineItems(allDeadlines);
+
         let message = '📃 <b>لیست رویداد ها</b>\n\n';
-        
-        if (allDeadlines.length === 0) {
-            message += '✅ هیچ تکلیف یا آزمون فعالی وجود ندارد!\n\n';
-        } else {
-            const byCourse = {};
-            for (const item of allDeadlines) {
-                if (!byCourse[item.courseName]) {
-                    byCourse[item.courseName] = [];
-                }
-                byCourse[item.courseName].push(item);
-            }
-            
-            for (const [courseName, items] of Object.entries(byCourse)) {
-                message += `📚 <b>${courseName}</b>\n\n`;
-                for (const item of items) {
-                    const isQuiz = item.isQuiz;
-                    const emoji = item.eventType === 'opened' ? '🔓' : (isQuiz ? '❓' : '📝');
-                    const label = item.eventType === 'opened' ? 'باز شدن' : (isQuiz ? 'بسته می‌شود' : 'مهلت');
-                    message += `${emoji} <b>${item.activityName}</b>\n`;
-                    message += `${label}: ${item.dateInfo.formatted}\n`;
-                    const days = item.dateInfo.daysRemaining;
-                    if (days === null) {
-                        message += `ℹ️ زمان نامشخص\n`;
-                    } else if (days < 0) {
-                        message += `❌ <b>گذشته</b>\n`;
-                    } else if (days === 0) {
-                        message += `🔴 <b>امروز</b>\n`;
-                    } else if (days === 1) {
-                        message += `⚠️ <b>1 روز باقی مانده</b>\n`;
-                    } else if (days <= 3) {
-                        message += `⚠️ ${days} روز دیگر\n`;
-                    } else if (days <= 7) {
-                        message += `🟡 ${days} روز دیگر\n`;
-                    } else {
-                        message += `✅ ${days} روز دیگر\n`;
-                    }
-                    message += '\n';
-                }
-                message += '━━━━━━━━━━━━━━━━━\n\n';
-            }
-        }
-        
+        message += this.renderDeadlineItems(allDeadlines, { groupByCourse: true });
+        message += `${this.getUpdateScheduleNotice()}\n`;
         message += `🕐 آخرین به‌روزرسانی (UTC): ${this.getShamsiUtcTimestamp()}`;
         const formattedMessage = this.toMarkdown(message);
         
@@ -1983,36 +2138,85 @@ class VUMonitor {
                 message += `📁 ${item.activity.name}\n`;
                 
                 try {
-                    // Extract file URL from resource page
-                    const fileInfo = await this.extractResourceFileUrl(item.activity.url);
+                    console.log(`📥 Extracting file URL for: ${item.activity.name}`);
+                    console.log(`📍 Resource URL: ${item.activity.url}`);
+                    
+                    // Extract file URL from resource page (follows redirects with cookies)
+                    let fileInfo = await this.extractResourceFileUrl(item.activity.url);
+                    
+                    // Fallback: try direct download from resource URL if extraction failed
+                    if (!fileInfo || !fileInfo.url) {
+                        console.log(`⚠️ Could not extract file URL, trying direct download from resource URL...`);
+                        try {
+                            const directResult = await this.downloadWithSessionCookies(item.activity.url);
+                            if (directResult && !directResult.contentType.includes('text/html')) {
+                                // Got a file directly, extract filename from URL
+                                const fileName = item.activity.name || 'file';
+                                fileInfo = { 
+                                    url: item.activity.url, 
+                                    fileName,
+                                    directBuffer: directResult.buffer,
+                                    contentType: directResult.contentType
+                                };
+                                console.log(`✅ Direct download successful: ${fileName}`);
+                            }
+                        } catch (directErr) {
+                            console.log(`⚠️ Direct download failed: ${directErr.message}`);
+                        }
+                    }
                     
                     if (fileInfo && fileInfo.url) {
-                        console.log(`📥 Attempting to download resource file: ${fileInfo.fileName}`);
+                        console.log(`📥 Downloading resource file: ${fileInfo.fileName}`);
+                        console.log(`🔗 File URL: ${fileInfo.url}`);
                         
-                        const { buffer, contentType, statusCode } = await this.downloadWithSessionCookies(fileInfo.url);
+                        let buffer, contentType;
+                        
+                        if (fileInfo.buffer) {
+                            // Already downloaded by followRedirectsForFileUrl
+                            buffer = fileInfo.buffer;
+                            contentType = fileInfo.contentType;
+                            console.log(`✅ Using pre-downloaded buffer (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
+                        } else if (fileInfo.directBuffer) {
+                            // Downloaded directly from resource URL
+                            buffer = fileInfo.directBuffer;
+                            contentType = fileInfo.contentType;
+                        } else {
+                            // Download from extracted URL
+                            console.log(`📥 Downloading from: ${fileInfo.url}`);
+                            const downloadResult = await this.downloadWithSessionCookies(fileInfo.url);
+                            buffer = downloadResult.buffer;
+                            contentType = downloadResult.contentType;
+                        }
                         
                         // Check if we got HTML instead of file
                         if (contentType.includes('text/html')) {
-                            throw new Error('Received HTML instead of file');
+                            const preview = buffer.toString('utf8').substring(0, 200);
+                            console.log(`⚠️ Received HTML instead of file. Preview: ${preview}`);
+                            throw new Error('Received HTML instead of file - session may have expired');
                         }
                         
                         const fileSizeMB = buffer.length / (1024 * 1024);
-                        console.log(`📄 File size: ${fileSizeMB.toFixed(2)} MB`);
+                        console.log(`📄 File size: ${fileSizeMB.toFixed(2)} MB, Content-Type: ${contentType}`);
                         
                         if (fileSizeMB <= 100) {
-                            // Send notification first
-                            await this.sendTelegramMessage(message, {
-                                chatIds: this.getCourseTargetChatIds(courseId)
-                            });
+                            // Build full caption with notification details
+                            let caption = `🆕 <b>فایل جدید</b>\n\n`;
+                            caption += `🎓 درس: ${courseName}\n`;
+                            caption += `📍 بخش: ${item.section}\n\n`;
+                            caption += `📎 ${fileInfo.fileName}`;
                             
-                            // Send file as attachment
+                            // Convert HTML to Markdown for Telegram
+                            const formattedCaption = this.toMarkdown(caption);
+                            
+                            // Send file with full notification as caption
                             const targetChatIds = this.getCourseTargetChatIds(courseId);
                             for (const chatId of targetChatIds) {
+                                console.log(`📤 Sending file to chat ${chatId}...`);
                                 await this.sendDocumentViaApi({
                                     chatId,
                                     buffer,
                                     fileName: fileInfo.fileName,
-                                    caption: `📎 ${fileInfo.fileName}`,
+                                    caption: formattedCaption,
                                     contentType
                                 });
                             }
@@ -2033,6 +2237,7 @@ class VUMonitor {
                         }
                     } else {
                         // Couldn't extract file URL, send link only
+                        console.log(`⚠️ Could not extract file URL for: ${item.activity.name}`);
                         message += `🔗 ${item.activity.url}\n`;
                         await this.sendTelegramMessage(message, {
                             chatIds: this.getCourseTargetChatIds(courseId),
@@ -2136,17 +2341,17 @@ class VUMonitor {
         try {
             const match = deadlineText.match(/(\w+)،\s*(\d+)\s+(\w+)\s+(\d+)،\s*(.+)/);
             if (!match) return { formatted: deadlineText, daysRemaining: null };
-            const day = match[2];
+            const day = parseInt(match[2]);
             const monthName = match[3];
-            const year = match[4];
+            const year = parseInt(match[4]);
             const time = match[5];
             const months = {
-                'January': '01', 'February': '02', 'March': '03', 'April': '04',
-                'May': '05', 'June': '06', 'July': '07', 'August': '08',
-                'September': '09', 'October': '10', 'November': '11', 'December': '12'
+                'January': 0, 'February': 1, 'March': 2, 'April': 3,
+                'May': 4, 'June': 5, 'July': 6, 'August': 7,
+                'September': 8, 'October': 9, 'November': 10, 'December': 11
             };
             const month = months[monthName];
-            if (!month) return { formatted: deadlineText, daysRemaining: null };
+            if (month === undefined) return { formatted: deadlineText, daysRemaining: null };
             let time24 = time;
             const timeMatch = time.match(/(\d+):(\d+)\s*(AM|PM)/i);
             if (timeMatch) {
@@ -2162,13 +2367,16 @@ class VUMonitor {
                 
                 time24 = `${hours.toString().padStart(2, '0')}:${minutes}`;
             }
-            const gregorianDate = `${year}-${month}-${day.padStart(2, '0')}`;
+            const gregorianDate = `${year}-${(month+1).toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`;
             const shamsiDate = this.convertToShamsi(gregorianDate);
-            const deadline = new Date(year, parseInt(month) - 1, parseInt(day));
-            const now = new Date();
-            const diffTime = deadline - now;
-            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-            const dayOfWeek = deadline.getDay();
+            // Compare by UTC day boundaries so remaining days match the UTC
+            // timestamp shown in the footer (last update time).
+            const deadlineUtc = new Date(Date.UTC(year, month, day));
+            const nowUtc = new Date();
+            nowUtc.setUTCHours(0, 0, 0, 0);
+            const diffTime = deadlineUtc.getTime() - nowUtc.getTime();
+            const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+            const dayOfWeek = new Date(year, month, day).getDay();
             const persianDayName = this.getPersianDayName(dayOfWeek);
             let formattedShamsi = shamsiDate;
             if (shamsiDate) {
@@ -2201,10 +2409,11 @@ class VUMonitor {
             };
             const month = months[monthName];
             if (month === undefined) return null;
-            const deadline = new Date(year, month, day);
-            const now = new Date();
-            const diffTime = deadline - now;
-            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+            const deadlineUtc = new Date(Date.UTC(year, month, day));
+            const nowUtc = new Date();
+            nowUtc.setUTCHours(0, 0, 0, 0);
+            const diffTime = deadlineUtc.getTime() - nowUtc.getTime();
+            const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
             return diffDays > 0 ? diffDays : 0;
         } catch (error) {
             return null;
@@ -2212,23 +2421,28 @@ class VUMonitor {
     }
     isInQuietHours() {
         try {
+            // Check if quiet hours is disabled via env
+            if (!CONFIG.quietHoursEnabled) {
+                console.log('🕐 Quiet hours is DISABLED via QUIET_HOURS_ENABLED=false');
+                return false;
+            }
+            
+            // Server timezone is Asia/Tehran, use local time directly
             const now = new Date();
-            const fmt = new Intl.DateTimeFormat('en-GB', {
-                timeZone: 'Asia/Tehran',
-                hour12: false,
-                hour: '2-digit',
-                minute: '2-digit'
-            }).format(now);
-            const parts = fmt.split(':');
-            const hour = parseInt(parts[0].replace(/^0+/, '') || '0', 10);
-            const minute = parseInt(parts[1].replace(/^0+/, '') || '0', 10);
-            if (isNaN(hour) || isNaN(minute)) return false;
+            const hour = now.getHours();
+            const minute = now.getMinutes();
+            
+            // Always log for debugging timezone issues
+            console.log(`🕐 Quiet hours check - Local: ${now.toLocaleString()}, Hours: ${hour}, Minutes: ${minute}`);
+            
             const totalMinutes = hour * 60 + minute;
-            const quietStart = 0 * 60 + 30;
-            const quietEnd = 7 * 60 + 30;
-            return totalMinutes >= quietStart && totalMinutes < quietEnd;
+            const quietStart = 0 * 60 + 30;  // 00:30
+            const quietEnd = 7 * 60 + 30;    // 07:30
+            const isQuiet = totalMinutes >= quietStart && totalMinutes < quietEnd;
+            console.log(`🕐 totalMinutes: ${totalMinutes}, quietStart: ${quietStart}, quietEnd: ${quietEnd}, isQuiet: ${isQuiet}`);
+            return isQuiet;
         } catch (error) {
-            console.error('Error determining Tehran time for quiet hours check:', error.message);
+            console.error('Error determining time for quiet hours check:', error.message);
             return false;
         }
     }
@@ -2244,6 +2458,9 @@ class VUMonitor {
     getShamsiUtcTimestamp() {
         // Jalali date with UTC time (HH:mm) for consistent footer display.
         return moment.utc().format('jYYYY/jMM/jDD HH:mm [UTC]');
+    }
+    getUpdateScheduleNotice() {
+        return `ℹ️ پیام ها هر ${CONFIG.checkInterval} دقیقه از طریق پورتال و ویو آپدیت خواهند شد.`;
     }
     async sendTelegramMessage(message, options = {}) {
         try {
@@ -2297,136 +2514,172 @@ class VUMonitor {
             chatIds: this.getCourseTargetChatIds(courseId, course.url)
         });
     }
+
     async checkAndSendReminders() {
         console.log('⏰ Checking for assignment reminders...');
-        
-        const now = new Date();
-        const in24Hours = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-        
+
+        const nowUtc = new Date(); // current UTC moment
+
         for (const [courseId, course] of Object.entries(this.courseData)) {
-            for (const [sectionName, activities] of Object.entries(course.sections)) {
+            for (const [sectionName, activities] of Object.entries(course.sections || {})) {
                 for (const activity of activities) {
                     if (!['assign', 'mod_assign', 'quiz', 'mod_quiz'].includes(activity.type)) continue;
-                    
+
                     const isQuiz = activity.type === 'quiz' || activity.type === 'mod_quiz';
-                    
-                    const reminderKey = `${courseId}_${activity.url}`;
-                    
-                    if (this.sentReminders[reminderKey]) {
+                    const lastDayReminderKey = `${courseId}_${activity.url}_lastday`;
+
+                    // Already sent last-day reminder → skip
+                    if (this.sentLastDayReminders[lastDayReminderKey]) {
+                        console.log(`📅 Last day reminder already sent for: ${activity.name}`);
                         continue;
                     }
-                    
+
                     try {
-                        const details = isQuiz ? await this.extractQuizDetails(activity.url) : await this.extractAssignmentDetails(activity.url);
-                        const deadlineField = isQuiz ? 'closed' : 'deadline';
-                        
-                        if (details[deadlineField] && details[deadlineField] !== 'نامشخص') {
-                            const match = details[deadlineField].match(/(\d+)\s+(\w+)\s+(\d+)،\s*(.+)/);
-                            if (!match) continue;
-                            
-                            const day = match[1];
-                            const monthName = match[2];
-                            const year = match[3];
-                            const time = match[4];
-                            
-                            const months = {
-                                'January': '01', 'February': '02', 'March': '03', 'April': '04',
-                                'May': '05', 'June': '06', 'July': '07', 'August': '08',
-                                'September': '09', 'October': '10', 'November': '11', 'December': '12'
-                            };
-                            
-                            const month = months[monthName];
-                            if (!month) continue;
-                            
-                            const timeMatch = time.match(/(\d+):(\d+)\s*(AM|PM)/i);
-                            let hours = 0;
-                            let minutes = 0;
-                            
-                            if (timeMatch) {
-                                hours = parseInt(timeMatch[1]);
-                                minutes = parseInt(timeMatch[2]);
-                                const period = timeMatch[3].toUpperCase();
-                                
-                                if (period === 'PM' && hours !== 12) {
-                                    hours += 12;
-                                } else if (period === 'AM' && hours === 12) {
-                                    hours = 0;
+                        // Use cached details; only fetch if not present
+                        let details = (course.assignments || {})[activity.url];
+                        if (!details) {
+                            details = isQuiz
+                                ? await this.extractQuizDetails(activity.url)
+                                : await this.extractAssignmentDetails(activity.url);
+                            if (details && details.success !== false) {
+                                if (!this.courseData[courseId].assignments) {
+                                    this.courseData[courseId].assignments = {};
                                 }
-                            }
-                            
-                            const deadline = new Date(year, parseInt(month) - 1, parseInt(day), hours, minutes);
-                            
-                            const hoursUntilDeadline = (deadline - now) / (1000 * 60 * 60);
-                            
-                            if (hoursUntilDeadline <= 0) {
-                                console.log(`⏭️ Skipping reminder for ${activity.name} - deadline has passed`);
-                                continue;
-                            }
-                            
-                            if (hoursUntilDeadline > 0 && hoursUntilDeadline <= 24) {
-                                const lastDayReminderKey = `${courseId}_${activity.url}_lastday`;
-                                
-                                if (this.sentLastDayReminders[lastDayReminderKey]) {
-                                    console.log(`📅 Last day reminder already sent for: ${activity.name}`);
-                                    continue;
-                                }
-                                
-                                const dateInfo = this.formatPersianDate(details[deadlineField]);
-                                
-                                let message = `⏰ <b>یادآوری: مهلت ${isQuiz ? 'آزمون' : 'تکلیف'} رو به پایان است!</b>\n\n`;
-                                message += `🎓 درس: ${course.name}\n`;
-                                message += `📍 بخش: ${sectionName}\n\n`;
-                                message += `${isQuiz ? '❓' : '📝'} ${activity.name}\n\n`;
-                                message += `⏰ ${isQuiz ? 'بسته می‌شود' : 'مهلت'}: ${dateInfo.formatted}\n`;
-                                
-                                const hoursRemaining = Math.floor(hoursUntilDeadline);
-                                const minutesRemaining = Math.floor((hoursUntilDeadline - hoursRemaining) * 60);
-                                
-                                if (hoursRemaining === 0) {
-                                    message += `🔴 <b>فقط ${minutesRemaining} دقیقه دیگر!</b>`;
-                                } else {
-                                    message += `🔴 <b>فقط ${hoursRemaining} ساعت و ${minutesRemaining} دقیقه دیگر!</b>`;
-                                }
-                                
-                                await this.sendTelegramMessage(message, {
-                                    chatIds: this.getCourseTargetChatIds(courseId, course.url),
-                                    reply_markup: {
-                                        inline_keyboard: [[
-                                            { text: `🔗 مشاهده ${isQuiz ? 'آزمون' : 'تکلیف'}`, url: activity.url }
-                                        ]]
-                                    }
-                                });
-                                
-                                this.sentLastDayReminders[lastDayReminderKey] = {
-                                    sentAt: now.toISOString(),
-                                    deadline: deadline.toISOString(),
-                                    courseName: course.name,
-                                    activityName: activity.name
-                                };
-                                
-                                this.sentReminders[reminderKey] = {
-                                    sentAt: now.toISOString(),
-                                    deadline: deadline.toISOString(),
-                                    courseName: course.name,
-                                    activityName: activity.name
-                                };
-                                
-                                await this.saveData();
-                                
-                                console.log(`⏰ Sent last day reminder for: ${activity.name}`);
-                                
-                                await new Promise(r => setTimeout(r, 2000));
+                                this.courseData[courseId].assignments[activity.url] = details;
                             }
                         }
+
+                        const deadlineField = isQuiz ? 'closed' : 'deadline';
+                        const deadlineText = details && details[deadlineField];
+
+                        if (!deadlineText || deadlineText === 'نامشخص') continue;
+
+                        // ------------------------------------------------------------------
+                        // Parse deadline as UTC (matching footer timestamp convention)
+                        // Expected format: "DayName، DD MonthName YYYY، HH:MM AM/PM"
+                        // e.g. "شنبه، 23 اسفند 1404 - ساعت 23:59"  ← already formatted
+                        // Raw Moodle format: "Saturday, 14 June 2025, 11:59 PM"
+                        // ------------------------------------------------------------------
+                        const rawMatch = deadlineText.match(
+                            /(\w+)،\s*(\d+)\s+(\w+)\s+(\d+)،\s*(.+)/
+                        );
+                        if (!rawMatch) {
+                            console.log(`⚠️ Could not parse deadline for ${activity.name}: "${deadlineText}"`);
+                            continue;
+                        }
+
+                        const day   = parseInt(rawMatch[2]);
+                        const monthName = rawMatch[3];
+                        const year  = parseInt(rawMatch[4]);
+                        const timeStr = rawMatch[5].trim();
+
+                        const months = {
+                            'January':1,'February':2,'March':3,'April':4,
+                            'May':5,'June':6,'July':7,'August':8,
+                            'September':9,'October':10,'November':11,'December':12
+                        };
+                        const month = months[monthName];
+                        if (!month) {
+                            console.log(`⚠️ Unknown month "${monthName}" for ${activity.name}`);
+                            continue;
+                        }
+
+                        // Parse time (12h or 24h)
+                        let hours = 23, minutes = 59;
+                        const timeMatch12 = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
+                        const timeMatch24 = timeStr.match(/^(\d{1,2}):(\d{2})$/);
+                        if (timeMatch12) {
+                            hours = parseInt(timeMatch12[1]);
+                            minutes = parseInt(timeMatch12[2]);
+                            const period = timeMatch12[3].toUpperCase();
+                            if (period === 'PM' && hours !== 12) hours += 12;
+                            else if (period === 'AM' && hours === 12) hours = 0;
+                        } else if (timeMatch24) {
+                            hours = parseInt(timeMatch24[1]);
+                            minutes = parseInt(timeMatch24[2]);
+                        }
+
+                        // Build deadline as UTC timestamp (consistent with footer)
+                        const deadlineUtc = new Date(Date.UTC(year, month - 1, day, hours, minutes, 0));
+
+                        const msUntilDeadline = deadlineUtc.getTime() - nowUtc.getTime();
+                        const hoursUntilDeadline = msUntilDeadline / (1000 * 60 * 60);
+
+                        console.log(
+                            `📅 ${activity.name}: deadline UTC=${deadlineUtc.toISOString()}, ` +
+                            `now UTC=${nowUtc.toISOString()}, hoursLeft=${hoursUntilDeadline.toFixed(2)}`
+                        );
+
+                        // Skip if already expired
+                        if (hoursUntilDeadline <= 0) {
+                            console.log(`⏭️ Skipping reminder for ${activity.name} - deadline has passed`);
+                            continue;
+                        }
+
+                        // Only send reminder when ≤ 24 hours remain
+                        if (hoursUntilDeadline > 24) {
+                            console.log(`✅ ${activity.name}: ${hoursUntilDeadline.toFixed(1)}h left, no reminder yet`);
+                            continue;
+                        }
+
+                        // Build reminder message
+                        const dateInfo = this.formatPersianDate(deadlineText);
+                        let message = `⏰ *یادآوری: مهلت ${isQuiz ? 'آزمون' : 'تکلیف'} رو به پایان است!*\n\n`;
+                        message += `🎓 درس: ${course.name}\n`;
+                        message += `📍 بخش: ${sectionName}\n\n`;
+                        message += `${isQuiz ? '❓' : '📝'} ${activity.name}\n\n`;
+                        message += `⏰ ${isQuiz ? 'بسته می‌شود' : 'مهلت'}: ${dateInfo.formatted}\n`;
+
+                        const hoursRemaining  = Math.floor(hoursUntilDeadline);
+                        const minutesRemaining = Math.floor((hoursUntilDeadline - hoursRemaining) * 60);
+
+                        if (hoursRemaining === 0) {
+                            message += `🔴 *فقط ${minutesRemaining} دقیقه دیگر!*`;
+                        } else {
+                            message += `🔴 *فقط ${hoursRemaining} ساعت و ${minutesRemaining} دقیقه دیگر!*`;
+                        }
+
+                        // Send to BOTH global chat AND course-specific chat
+                        const targetChatIds = this.getCourseTargetChatIds(courseId, course.url);
+                        console.log(`📤 Sending reminder for "${activity.name}" to chats: ${targetChatIds.join(', ')}`);
+
+                        await this.sendTelegramMessage(message, {
+                            chatIds: targetChatIds,
+                            reply_markup: {
+                                inline_keyboard: [[
+                                    { text: `🔗 مشاهده ${isQuiz ? 'آزمون' : 'تکلیف'}`, url: activity.url }
+                                ]]
+                            }
+                        });
+
+                        // Persist so we never send twice
+                        const reminderRecord = {
+                            sentAt: nowUtc.toISOString(),
+                            deadline: deadlineUtc.toISOString(),
+                            courseName: course.name,
+                            activityName: activity.name
+                        };
+
+                        this.sentLastDayReminders[lastDayReminderKey] = reminderRecord;
+                        // Also mark in sentReminders for backward compatibility
+                        const reminderKey = `${courseId}_${activity.url}`;
+                        this.sentReminders[reminderKey] = reminderRecord;
+
+                        await this.saveData();
+
+                        console.log(`⏰ Sent last-day reminder for: ${activity.name}`);
+                        await new Promise(r => setTimeout(r, 2000));
+
                     } catch (error) {
                         console.error(`Error checking reminder for ${activity.name}:`, error.message);
                     }
                 }
             }
         }
-        
+
         console.log('✅ Reminder check completed');
     }
+
     async checkAllCourses() {
         console.log('\n' + '='.repeat(50));
         console.log('🔄 Starting course check cycle...');
