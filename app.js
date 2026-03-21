@@ -147,6 +147,19 @@ class VUMonitor {
         }
         return options;
     }
+    async deleteTelegramMessage(chatId, messageId) {
+        if (!messageId) {
+            return;
+        }
+        try {
+            await bot.deleteMessage(chatId, messageId);
+        } catch (error) {
+            const message = error?.message || '';
+            if (!message.includes('message to delete not found') && !message.includes('message cannot be deleted')) {
+                console.log(`⚠️ Could not delete message ${messageId} in chat ${chatId}:`, message);
+            }
+        }
+    }
     getStoredCourseMessageIds(courseId, chatId) {
         const stored = this.courseMessageIds[courseId];
         const key = String(chatId);
@@ -1394,14 +1407,6 @@ class VUMonitor {
         }
         
         message += `━━━━━━━━━━━━━━━━━\n`;
-        message += `📃 <b>لیست رویداد ها</b>\n\n`;
-
-        const courseDeadlines = this.collectCourseDeadlineItems(courseId);
-        message += this.renderDeadlineItems(courseDeadlines, {
-            emptyMessage: '✅ فعلا رویداد فعالی برای این درس وجود ندارد.\n\n'
-        });
-
-        message += `━━━━━━━━━━━━━━━━━\n`;
         message += `${this.getUpdateScheduleNotice()}\n`;
         message += `🕐 ${this.getShamsiUtcTimestamp()}`;
         const formattedMessage = this.toMarkdown(message);
@@ -1444,6 +1449,9 @@ class VUMonitor {
                     }
                 }
 
+                for (const extraId of existingIds.slice(messageParts.length)) {
+                    await this.deleteTelegramMessage(chatId, extraId);
+                }
                 this.setStoredCourseMessageIds(courseId, chatId, finalIds);
             } catch (error) {
                 console.error(`Error sending/updating course overview for chat ${chatId}:`, error.message);
@@ -1452,6 +1460,9 @@ class VUMonitor {
                     for (const part of messageParts) {
                         const sentMsg = await bot.sendMessage(chatId, part, scopedOptions);
                         sentIds.push(sentMsg.message_id);
+                    }
+                    for (const existingId of existingIds) {
+                        await this.deleteTelegramMessage(chatId, existingId);
                     }
                     this.setStoredCourseMessageIds(courseId, chatId, sentIds);
                 }
