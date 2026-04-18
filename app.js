@@ -106,7 +106,6 @@ if (CONFIG.httpProxy) {
 const bot = new TelegramBot(CONFIG.telegram.token, botOptions);
 let monitor = null;
 const DATA_FILE = 'course_data.json';
-const COURSE_DEADLINE_MESSAGE_IDS_FILE = 'course_deadline_message_ids.json';
 class VUMonitor {
     constructor() {
         this.browser = null;
@@ -115,7 +114,6 @@ class VUMonitor {
         this.cronJob = null;
         this.isFirstRun = false;
         this.courseMessageIds = {};
-        this.courseDeadlineMessageIds = {};
         this.sentReminders = {};
         this.sentLastDayReminders = {};
         this.deadlineMessageId = null;
@@ -148,9 +146,7 @@ class VUMonitor {
         return options;
     }
     async deleteTelegramMessage(chatId, messageId) {
-        if (!messageId) {
-            return;
-        }
+        if (!messageId) return;
         try {
             await bot.deleteMessage(chatId, messageId);
         } catch (error) {
@@ -185,21 +181,6 @@ class VUMonitor {
         }
         this.courseMessageIds[courseId][key] = ids;
     }
-    getStoredCourseDeadlineMessageId(courseId, chatId) {
-        const stored = this.courseDeadlineMessageIds[courseId];
-        const key = String(chatId);
-        if (stored && typeof stored === 'object' && stored[key]) {
-            return stored[key];
-        }
-        return null;
-    }
-    setStoredCourseDeadlineMessageId(courseId, chatId, messageId) {
-        const key = String(chatId);
-        if (!this.courseDeadlineMessageIds[courseId] || typeof this.courseDeadlineMessageIds[courseId] !== 'object') {
-            this.courseDeadlineMessageIds[courseId] = {};
-        }
-        this.courseDeadlineMessageIds[courseId][key] = messageId;
-    }
     findChromePath() {
         const possiblePaths = process.platform === 'win32' ? [
             'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
@@ -215,10 +196,10 @@ class VUMonitor {
             '/snap/bin/chromium'
         ];
         
-            const chromePath = possiblePaths.find(path => path && require('fs').existsSync(path));
-            if (chromePath) {
-                return chromePath;
-            }
+        const chromePath = possiblePaths.find(path => path && require('fs').existsSync(path));
+        if (chromePath) {
+            return chromePath;
+        }
         
         return null;
     }
@@ -315,14 +296,6 @@ class VUMonitor {
             this.courseMessageIds = {};
         }
         try {
-            const courseDeadlineMsgData = await fs.readFile(COURSE_DEADLINE_MESSAGE_IDS_FILE, 'utf8');
-            this.courseDeadlineMessageIds = JSON.parse(courseDeadlineMsgData);
-            console.log('📃 Loaded course deadline message IDs');
-        } catch (error) {
-            console.log('📃 No course deadline message IDs found');
-            this.courseDeadlineMessageIds = {};
-        }
-        try {
             const deadlineMsgData = await fs.readFile('deadline_message_id.json', 'utf8');
             this.deadlineMessageId = JSON.parse(deadlineMsgData).messageId;
             console.log('⏰ Loaded deadline message ID');
@@ -354,7 +327,6 @@ class VUMonitor {
         this.cleanExpiredReminders();
         await fs.writeFile(DATA_FILE, JSON.stringify(this.courseData, null, 2));
         await fs.writeFile('message_ids.json', JSON.stringify(this.courseMessageIds, null, 2));
-        await fs.writeFile(COURSE_DEADLINE_MESSAGE_IDS_FILE, JSON.stringify(this.courseDeadlineMessageIds, null, 2));
         await fs.writeFile('reminders.json', JSON.stringify(this.sentReminders, null, 2));
         await fs.writeFile('last_day_reminders.json', JSON.stringify(this.sentLastDayReminders, null, 2));
         if (this.deadlineMessageId) {
@@ -716,7 +688,6 @@ class VUMonitor {
                 sectionElements.forEach((section, index) => {
                     let sectionName = '';
                     
-                    // New structure: h3 with sectionname class and data-for="section_title"
                     const sectionNameElement = section.querySelector('h3.sectionname[data-for="section_title"]') ||
                                              section.querySelector('h3[class*="sectionname"]') ||
                                              section.querySelector('.sectionname') ||
@@ -732,11 +703,9 @@ class VUMonitor {
                     
                     const activities = [];
                     
-                    // New structure: activities within ul[data-for="cmlist"]
                     let activityContainer = section.querySelector('ul[data-for="cmlist"]') || section;
                     let activityElements = activityContainer.querySelectorAll('li.activity[data-for="cmitem"]');
                     
-                    // Fallback selectors
                     if (activityElements.length === 0) {
                         activityElements = activityContainer.querySelectorAll('li.activity.activity-wrapper');
                     }
@@ -750,12 +719,10 @@ class VUMonitor {
                     activityElements.forEach(activity => {
                         let activityName = 'Unknown';
                         
-                        // Best method: use data-activityname attribute from .activity-item
                         const activityItem = activity.querySelector('.activity-item[data-activityname]');
                         if (activityItem && activityItem.dataset.activityname) {
                             activityName = activityItem.dataset.activityname.trim();
                         } else {
-                            // Fallback: extract from .instancename, removing hidden elements
                             const instanceElement = activity.querySelector('.instancename') ||
                                                   activity.querySelector('.activityname a span') ||
                                                   activity.querySelector('.activityname');
@@ -768,12 +735,10 @@ class VUMonitor {
                             }
                         }
                         
-                        // Extract activity type from class (modtype_resource, modtype_forum, etc.)
                         const activityType = activity.className.match(/modtype_(\w+)/)?.[1] ||
                                             activity.className.match(/modtype-(\w+)/)?.[1] ||
                                             'unknown';
                         
-                        // Extract activity URL
                         const activityLink = activity.querySelector('a.aalink.stretched-link') ||
                                             activity.querySelector('a.aalink') ||
                                             activity.querySelector('a[href*="/mod/"]') ||
@@ -845,30 +810,24 @@ class VUMonitor {
     }
     async extractResourceFileUrl(resourceUrl) {
         try {
-            // Try to download directly from resource URL by following redirects with cookies
-            // Moodle's mod/resource/view.php redirects to the actual pluginfile.php
             const result = await this.followRedirectsForFileUrl(resourceUrl);
             if (result && result.url) {
                 return result;
             }
             
-            // Fallback: use Puppeteer to navigate and extract URL
             await this.page.goto(resourceUrl, {
                 waitUntil: 'domcontentloaded',
                 timeout: 60000
             });
             await new Promise(r => setTimeout(r, 3000));
             
-            // Check if we were redirected directly to the file
             const currentUrl = this.page.url();
             if (currentUrl.includes('pluginfile.php')) {
                 const fileName = decodeURIComponent(currentUrl.split('/').pop().split('?')[0]);
                 return { url: currentUrl, fileName };
             }
             
-            // Extract file URL from resource page
             const fileInfo = await this.page.evaluate(() => {
-                // Look for direct download link
                 const resourceLink = document.querySelector('.resourceworkaround a[href*="pluginfile.php"]') ||
                                    document.querySelector('.resourcecontent a[href*="pluginfile.php"]') ||
                                    document.querySelector('a[href*="pluginfile.php"]');
@@ -880,7 +839,6 @@ class VUMonitor {
                     return { url, fileName };
                 }
                 
-                // Look for embedded object/iframe
                 const objectTag = document.querySelector('object[data*="pluginfile.php"]');
                 if (objectTag) {
                     const url = objectTag.data;
@@ -906,8 +864,6 @@ class VUMonitor {
     }
     
     async followRedirectsForFileUrl(startUrl, redirectsLeft = 10) {
-        // Follow redirects with session cookies using GET to find the final file URL
-        // Moodle redirects resource/view.php to pluginfile.php
         if (redirectsLeft < 0) {
             return null;
         }
@@ -932,9 +888,8 @@ class VUMonitor {
                 const statusCode = res.statusCode || 0;
                 const headers = res.headers || {};
 
-                // Handle redirects
                 if ([301, 302, 303, 307, 308].includes(statusCode) && headers.location) {
-                    res.resume(); // Discard body
+                    res.resume();
                     const redirectUrl = new URL(headers.location, startUrl).toString();
                     console.log(`↪️ Redirect ${statusCode}: ${redirectUrl}`);
                     this.followRedirectsForFileUrl(redirectUrl, redirectsLeft - 1)
@@ -947,23 +902,18 @@ class VUMonitor {
                     const contentType = (headers['content-type'] || '').toString();
                     const contentDisposition = (headers['content-disposition'] || '').toString();
                     
-                    // Check if this is a file (not HTML)
                     if (!contentType.includes('text/html')) {
                         let fileName = '';
                         
-                        // Try to get filename from Content-Disposition header
-                        // Format: attachment; filename="file.pdf" or filename*=UTF-8''file.pdf
                         const filenameMatch = contentDisposition.match(/filename[*]?=['"]?(?:UTF-8'')?([^'";]+)/i);
                         if (filenameMatch) {
                             fileName = decodeURIComponent(filenameMatch[1].trim());
                         } else {
-                            // Extract from URL
                             fileName = decodeURIComponent(startUrl.split('/').pop().split('?')[0]);
                         }
                         
                         console.log(`✅ Found file: ${fileName} (${contentType})`);
                         
-                        // Read the body since we need it
                         const chunks = [];
                         res.on('data', (chunk) => chunks.push(chunk));
                         res.on('end', () => {
@@ -976,7 +926,6 @@ class VUMonitor {
                         });
                         return;
                     } else {
-                        // Got HTML - might be login page or error
                         const chunks = [];
                         res.on('data', (chunk) => chunks.push(chunk));
                         res.on('end', () => {
@@ -1116,7 +1065,6 @@ class VUMonitor {
             console.log(`📄 Content-Type: ${contentType}`);
             console.log(`📡 Response status: ${statusCode}`);
             
-            // Check if we got an HTML page (login redirect) instead of a file
             if (contentType.includes('text/html')) {
                 const bodyText = buffer.toString('utf8').substring(0, 500);
                 console.log(`⚠️ Received HTML instead of file: ${bodyText.substring(0, 200)}...`);
@@ -1379,6 +1327,7 @@ class VUMonitor {
         }
         return changes;
     }
+    // ─── Course overview: global chat only ───────────────────────────────────
     async sendOrUpdateCourseOverview(courseId, courseName, courseUrl, allSections) {
         let message = `🎓 <b>${courseName}</b>\n`;
         message += `🔗 <a href="${courseUrl}">لینک درس</a>\n\n`;
@@ -1407,69 +1356,115 @@ class VUMonitor {
         }
         
         message += `━━━━━━━━━━━━━━━━━\n`;
-        message += `${this.getUpdateScheduleNotice()}\n`;
-        message += `🕐 ${this.getShamsiUtcTimestamp()}`;
+        message += `🕐 ${this.getLocalTimestamp()}`;
+
         const formattedMessage = this.toMarkdown(message);
         const messageParts = this.splitCourseOverviewMessage(formattedMessage);
         const baseOptions = {
             parse_mode: 'Markdown',
             disable_web_page_preview: true
         };
-        const targetChatIds = this.getCourseTargetChatIds(courseId, courseUrl);
 
-        for (const chatId of targetChatIds) {
-            const existingIds = this.getStoredCourseMessageIds(courseId, chatId);
-            const finalIds = [];
-            const scopedOptions = this.getChatScopedOptions(baseOptions, chatId);
+        // Send overview to global chat ONLY — not to per-course extra chats
+        const globalChatId = CONFIG.telegram.globalChatId
+            ? String(CONFIG.telegram.globalChatId)
+            : null;
 
-            try {
-                for (let i = 0; i < messageParts.length; i++) {
-                    const part = messageParts[i];
-                    const existingId = existingIds[i];
+        if (!globalChatId) {
+            console.log(`⚠️ No global chat ID configured; skipping course overview for ${courseId}`);
+            return;
+        }
 
-                    if (existingId) {
-                        try {
-                            await bot.editMessageText(part, {
-                                chat_id: chatId,
-                                message_id: existingId,
-                                ...scopedOptions
-                            });
-                            finalIds.push(existingId);
-                        } catch (editErr) {
-                            if (editErr.message && editErr.message.includes('message to edit not found')) {
-                                const sentMsg = await bot.sendMessage(chatId, part, scopedOptions);
-                                finalIds.push(sentMsg.message_id);
-                            } else {
-                                throw editErr;
-                            }
+        const chatId = globalChatId;
+        const existingIds = this.getStoredCourseMessageIds(courseId, chatId);
+        const finalIds = [];
+        const scopedOptions = this.getChatScopedOptions(baseOptions, chatId);
+
+        try {
+            for (let i = 0; i < messageParts.length; i++) {
+                const part = messageParts[i];
+                const existingId = existingIds[i];
+
+                if (existingId) {
+                    try {
+                        await bot.editMessageText(part, {
+                            chat_id: chatId,
+                            message_id: existingId,
+                            ...scopedOptions
+                        });
+                        finalIds.push(existingId);
+                    } catch (editErr) {
+                        if (editErr.message && editErr.message.includes('message to edit not found')) {
+                            const sentMsg = await bot.sendMessage(chatId, part, scopedOptions);
+                            finalIds.push(sentMsg.message_id);
+                        } else {
+                            throw editErr;
                         }
-                    } else {
-                        const sentMsg = await bot.sendMessage(chatId, part, scopedOptions);
-                        finalIds.push(sentMsg.message_id);
                     }
+                } else {
+                    const sentMsg = await bot.sendMessage(chatId, part, scopedOptions);
+                    finalIds.push(sentMsg.message_id);
                 }
+            }
 
-                for (const extraId of existingIds.slice(messageParts.length)) {
-                    await this.deleteTelegramMessage(chatId, extraId);
+            // Delete any extra old parts if message got shorter
+            for (const extraId of existingIds.slice(messageParts.length)) {
+                await this.deleteTelegramMessage(chatId, extraId);
+            }
+
+            this.setStoredCourseMessageIds(courseId, chatId, finalIds);
+        } catch (error) {
+            console.error(`Error sending/updating course overview for chat ${chatId}:`, error.message);
+            if (error.message.includes('message to edit not found')) {
+                const sentIds = [];
+                for (const part of messageParts) {
+                    const sentMsg = await bot.sendMessage(chatId, part, scopedOptions);
+                    sentIds.push(sentMsg.message_id);
                 }
-                this.setStoredCourseMessageIds(courseId, chatId, finalIds);
-            } catch (error) {
-                console.error(`Error sending/updating course overview for chat ${chatId}:`, error.message);
-                if (error.message.includes('message to edit not found')) {
-                    const sentIds = [];
-                    for (const part of messageParts) {
-                        const sentMsg = await bot.sendMessage(chatId, part, scopedOptions);
-                        sentIds.push(sentMsg.message_id);
-                    }
-                    for (const existingId of existingIds) {
-                        await this.deleteTelegramMessage(chatId, existingId);
-                    }
-                    this.setStoredCourseMessageIds(courseId, chatId, sentIds);
+                for (const existingId of existingIds) {
+                    await this.deleteTelegramMessage(chatId, existingId);
                 }
+                this.setStoredCourseMessageIds(courseId, chatId, sentIds);
             }
         }
 
         console.log(`✏️ Updated overview message for course ${courseId} in ${messageParts.length} part(s)`);
+    }
+    // ─── Startup cleanup: delete any overview messages sent to non-global chats
+    // and any previously sent per-course overview messages stored in message_ids.json
+    async cleanupNonGlobalOverviewMessages() {
+        const globalChatId = CONFIG.telegram.globalChatId
+            ? String(CONFIG.telegram.globalChatId)
+            : null;
+        let changed = false;
+
+        for (const [courseId, stored] of Object.entries(this.courseMessageIds || {})) {
+            if (!stored || Array.isArray(stored) || typeof stored !== 'object') {
+                continue;
+            }
+
+            for (const [chatId, messageIds] of Object.entries(stored)) {
+                // Keep global chat messages — delete everything else
+                if (globalChatId && String(chatId) === globalChatId) {
+                    continue;
+                }
+
+                if (Array.isArray(messageIds)) {
+                    for (const messageId of messageIds) {
+                        await this.deleteTelegramMessage(chatId, messageId);
+                    }
+                }
+
+                delete this.courseMessageIds[courseId][chatId];
+                changed = true;
+                console.log(`🧹 Removed course overview messages for course ${courseId} from chat ${chatId}`);
+            }
+        }
+
+        if (changed) {
+            await fs.writeFile('message_ids.json', JSON.stringify(this.courseMessageIds, null, 2));
+            console.log('✅ Cleaned non-global overview message IDs');
+        }
     }
     splitCourseOverviewMessage(message) {
         const TELEGRAM_LIMIT = 3900;
@@ -1500,150 +1495,112 @@ class VUMonitor {
 
         return [part1, part2];
     }
-    collectCourseDeadlineItems(courseId, course = this.courseData[courseId]) {
-        if (!course) {
-            return [];
-        }
-
-        const items = [];
-        const assignments = course.assignments || {};
-
-        for (const [url, details] of Object.entries(assignments)) {
-            let activityName = 'Unknown';
-            let activityType = 'assign';
-
-            for (const activities of Object.values(course.sections || {})) {
-                const activity = activities.find(a => a.url === url);
-                if (activity) {
-                    activityName = activity.name;
-                    activityType = activity.type;
-                    break;
-                }
-            }
-
-            const isQuiz = activityType === 'quiz' || activityType === 'mod_quiz';
-            const deadlineField = isQuiz ? 'closed' : 'deadline';
-
-            if (details.opened && details.opened !== 'نامشخص') {
-                const openedInfo = this.formatPersianDate(details.opened);
-                if (openedInfo.daysRemaining !== null && openedInfo.daysRemaining > 0) {
-                    items.push({
-                        courseId,
-                        courseName: course.name,
-                        activityName,
-                        activityType,
-                        url,
-                        dateInfo: openedInfo,
-                        isQuiz,
-                        eventType: 'opened'
-                    });
-                }
-            }
-
-            if (details[deadlineField] && details[deadlineField] !== 'نامشخص') {
-                const dateInfo = this.formatPersianDate(details[deadlineField]);
-                if (dateInfo.daysRemaining === null || dateInfo.daysRemaining >= 0) {
-                    items.push({
-                        courseId,
-                        courseName: course.name,
-                        activityName,
-                        activityType,
-                        url,
-                        dateInfo,
-                        isQuiz,
-                        eventType: 'deadline'
-                    });
-                }
-            }
-        }
-
-        return this.sortDeadlineItems(items);
-    }
-    sortDeadlineItems(items) {
-        return items.sort((a, b) => {
-            if (a.dateInfo.daysRemaining === null) return 1;
-            if (b.dateInfo.daysRemaining === null) return -1;
-            return a.dateInfo.daysRemaining - b.dateInfo.daysRemaining;
-        });
-    }
-    renderDeadlineItems(items, options = {}) {
-        const {
-            groupByCourse = false,
-            emptyMessage = '✅ هیچ تکلیف یا آزمون فعالی وجود ندارد!\n\n'
-        } = options;
-
-        if (!items || items.length === 0) {
-            return emptyMessage;
-        }
-
-        let message = '';
-        const renderItem = (item) => {
-            const emoji = item.eventType === 'opened' ? '🔓' : (item.isQuiz ? '❓' : '📝');
-            const label = item.eventType === 'opened' ? 'باز شدن' : (item.isQuiz ? 'بسته می‌شود' : 'مهلت');
-            let itemMessage = `${emoji} <b>${item.activityName}</b>\n`;
-            itemMessage += `${label}: ${item.dateInfo.formatted}\n`;
-
-            const days = item.dateInfo.daysRemaining;
-            if (days === null) {
-                itemMessage += 'ℹ️ زمان نامشخص\n';
-            } else if (days < 0) {
-                itemMessage += '❌ <b>گذشته</b>\n';
-            } else if (days === 0) {
-                itemMessage += '🔴 <b>امروز</b>\n';
-            } else if (days === 1) {
-                itemMessage += '⚠️ <b>1 روز باقی مانده</b>\n';
-            } else if (days <= 3) {
-                itemMessage += `⚠️ ${days} روز دیگر\n`;
-            } else if (days <= 7) {
-                itemMessage += `🟡 ${days} روز دیگر\n`;
-            } else {
-                itemMessage += `✅ ${days} روز دیگر\n`;
-            }
-
-            return itemMessage + '\n';
-        };
-
-        if (groupByCourse) {
-            const byCourse = {};
-            for (const item of items) {
-                if (!byCourse[item.courseName]) {
-                    byCourse[item.courseName] = [];
-                }
-                byCourse[item.courseName].push(item);
-            }
-
-            for (const [courseName, courseItems] of Object.entries(byCourse)) {
-                message += `📚 <b>${courseName}</b>\n\n`;
-                for (const item of courseItems) {
-                    message += renderItem(item);
-                }
-                message += '━━━━━━━━━━━━━━━━━\n\n';
-            }
-
-            return message;
-        }
-
-        for (const item of items) {
-            message += renderItem(item);
-        }
-
-        return message;
-    }
     async sendOrUpdateDeadlineOverview() {
         console.log('⏰ Updating deadline overview message...');
         
         const allDeadlines = [];
         
         for (const [courseId, course] of Object.entries(this.courseData)) {
-            allDeadlines.push(...this.collectCourseDeadlineItems(courseId, course));
+            const assignments = course.assignments || {};
+            
+            for (const [url, details] of Object.entries(assignments)) {
+                let activityName = 'Unknown';
+                let activityType = 'assign';
+                
+                for (const [sectionName, activities] of Object.entries(course.sections || {})) {
+                    const activity = activities.find(a => a.url === url);
+                    if (activity) {
+                        activityName = activity.name;
+                        activityType = activity.type;
+                        break;
+                    }
+                }
+                
+                const isQuiz = activityType === 'quiz' || activityType === 'mod_quiz';
+                const deadlineField = isQuiz ? 'closed' : 'deadline';
+                if (details.opened && details.opened !== 'نامشخص') {
+                    const openedInfo = this.formatPersianDate(details.opened);
+                    if (openedInfo.daysRemaining !== null && openedInfo.daysRemaining > 0) {
+                        allDeadlines.push({
+                            courseName: course.name,
+                            activityName,
+                            activityType,
+                            url,
+                            dateInfo: openedInfo,
+                            isQuiz,
+                            eventType: 'opened'
+                        });
+                    }
+                }
+                if (details[deadlineField] && details[deadlineField] !== 'نامشخص') {
+                    const dateInfo = this.formatPersianDate(details[deadlineField]);
+                    if (dateInfo.daysRemaining !== null && dateInfo.daysRemaining < 0) {
+                        // skip expired
+                    } else {
+                        allDeadlines.push({
+                            courseName: course.name,
+                            activityName,
+                            activityType,
+                            url,
+                            dateInfo,
+                            isQuiz,
+                            eventType: 'deadline'
+                        });
+                    }
+                }
+            }
         }
-
-        this.sortDeadlineItems(allDeadlines);
-
+        
+        allDeadlines.sort((a, b) => {
+            if (a.dateInfo.daysRemaining === null) return 1;
+            if (b.dateInfo.daysRemaining === null) return -1;
+            return a.dateInfo.daysRemaining - b.dateInfo.daysRemaining;
+        });
+        
         let message = '📃 <b>لیست رویداد ها</b>\n\n';
-        message += this.renderDeadlineItems(allDeadlines, { groupByCourse: true });
-        message += `${this.getUpdateScheduleNotice()}\n`;
-        message += `🕐 آخرین به‌روزرسانی (UTC): ${this.getShamsiUtcTimestamp()}`;
+        
+        if (allDeadlines.length === 0) {
+            message += '✅ هیچ تکلیف یا آزمون فعالی وجود ندارد!\n\n';
+        } else {
+            const byCourse = {};
+            for (const item of allDeadlines) {
+                if (!byCourse[item.courseName]) {
+                    byCourse[item.courseName] = [];
+                }
+                byCourse[item.courseName].push(item);
+            }
+            
+            for (const [courseName, items] of Object.entries(byCourse)) {
+                message += `📚 <b>${courseName}</b>\n\n`;
+                for (const item of items) {
+                    const isQuiz = item.isQuiz;
+                    const emoji = item.eventType === 'opened' ? '🔓' : (isQuiz ? '❓' : '📝');
+                    const label = item.eventType === 'opened' ? 'باز شدن' : (isQuiz ? 'بسته می‌شود' : 'مهلت');
+                    message += `${emoji} <b>${item.activityName}</b>\n`;
+                    message += `${label}: ${item.dateInfo.formatted}\n`;
+                    const days = item.dateInfo.daysRemaining;
+                    if (days === null) {
+                        message += `ℹ️ زمان نامشخص\n`;
+                    } else if (days < 0) {
+                        message += `❌ <b>گذشته</b>\n`;
+                    } else if (days === 0) {
+                        message += `🔴 <b>امروز</b>\n`;
+                    } else if (days === 1) {
+                        message += `⚠️ <b>1 روز باقی مانده</b>\n`;
+                    } else if (days <= 3) {
+                        message += `⚠️ ${days} روز دیگر\n`;
+                    } else if (days <= 7) {
+                        message += `🟡 ${days} روز دیگر\n`;
+                    } else {
+                        message += `✅ ${days} روز دیگر\n`;
+                    }
+                    message += '\n';
+                }
+                message += '━━━━━━━━━━━━━━━━━\n\n';
+            }
+        }
+        
+        message += `🕐 آخرین به‌روزرسانی: ${this.getLocalTimestamp()}`;
         const formattedMessage = this.toMarkdown(message);
         
         try {
@@ -1691,62 +1648,6 @@ class VUMonitor {
                 const sentMsg = await bot.sendMessage(CONFIG.telegram.globalChatId, formattedMessage, sendOptions);
                 this.deadlineMessageId = sentMsg.message_id;
                 await fs.writeFile('deadline_message_id.json', JSON.stringify({ messageId: this.deadlineMessageId }, null, 2));
-            }
-        }
-    }
-    async sendOrUpdateCourseDeadlineOverview(courseId, course = this.courseData[courseId]) {
-        if (!course) {
-            return;
-        }
-
-        const extraChatId = this.getCourseExtraChatId(courseId, course.url);
-        if (!extraChatId || String(extraChatId) === String(CONFIG.telegram.globalChatId)) {
-            return;
-        }
-
-        console.log(`📃 Updating deadline overview for course ${courseId} in chat ${extraChatId}...`);
-
-        const courseDeadlines = this.collectCourseDeadlineItems(courseId, course);
-        let message = `📃 <b>لیست رویداد های ${course.name}</b>\n`;
-        if (course.url) {
-            message += `🔗 <a href="${course.url}">لینک درس</a>\n\n`;
-        } else {
-            message += '\n';
-        }
-        message += this.renderDeadlineItems(courseDeadlines, {
-            emptyMessage: '✅ فعلا رویداد فعالی برای این درس وجود ندارد.\n\n'
-        });
-        message += `${this.getUpdateScheduleNotice()}\n`;
-        message += `🕐 آخرین به‌روزرسانی (UTC): ${this.getShamsiUtcTimestamp()}`;
-
-        const formattedMessage = this.toMarkdown(message);
-        const messageId = this.getStoredCourseDeadlineMessageId(courseId, extraChatId);
-        const sendOptions = this.getChatScopedOptions({
-            parse_mode: 'Markdown',
-            disable_web_page_preview: true
-        }, extraChatId);
-
-        try {
-            if (messageId) {
-                await bot.editMessageText(formattedMessage, {
-                    chat_id: extraChatId,
-                    message_id: messageId,
-                    ...sendOptions
-                });
-                console.log(`✏️ Updated course deadline overview for ${courseId}`);
-                return;
-            }
-
-            const sentMsg = await bot.sendMessage(extraChatId, formattedMessage, sendOptions);
-            this.setStoredCourseDeadlineMessageId(courseId, extraChatId, sentMsg.message_id);
-            await fs.writeFile(COURSE_DEADLINE_MESSAGE_IDS_FILE, JSON.stringify(this.courseDeadlineMessageIds, null, 2));
-            console.log(`📤 Sent new course deadline overview for ${courseId}`);
-        } catch (error) {
-            console.error(`Error sending/updating course deadline overview for ${courseId}:`, error.message);
-            if (error.message.includes('message to edit not found') || error.message.includes('message_id_invalid')) {
-                const sentMsg = await bot.sendMessage(extraChatId, formattedMessage, sendOptions);
-                this.setStoredCourseDeadlineMessageId(courseId, extraChatId, sentMsg.message_id);
-                await fs.writeFile(COURSE_DEADLINE_MESSAGE_IDS_FILE, JSON.stringify(this.courseDeadlineMessageIds, null, 2));
             }
         }
     }
@@ -2234,16 +2135,13 @@ class VUMonitor {
                     console.log(`📥 Extracting file URL for: ${item.activity.name}`);
                     console.log(`📍 Resource URL: ${item.activity.url}`);
                     
-                    // Extract file URL from resource page (follows redirects with cookies)
                     let fileInfo = await this.extractResourceFileUrl(item.activity.url);
                     
-                    // Fallback: try direct download from resource URL if extraction failed
                     if (!fileInfo || !fileInfo.url) {
                         console.log(`⚠️ Could not extract file URL, trying direct download from resource URL...`);
                         try {
                             const directResult = await this.downloadWithSessionCookies(item.activity.url);
                             if (directResult && !directResult.contentType.includes('text/html')) {
-                                // Got a file directly, extract filename from URL
                                 const fileName = item.activity.name || 'file';
                                 fileInfo = { 
                                     url: item.activity.url, 
@@ -2265,23 +2163,19 @@ class VUMonitor {
                         let buffer, contentType;
                         
                         if (fileInfo.buffer) {
-                            // Already downloaded by followRedirectsForFileUrl
                             buffer = fileInfo.buffer;
                             contentType = fileInfo.contentType;
                             console.log(`✅ Using pre-downloaded buffer (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
                         } else if (fileInfo.directBuffer) {
-                            // Downloaded directly from resource URL
                             buffer = fileInfo.directBuffer;
                             contentType = fileInfo.contentType;
                         } else {
-                            // Download from extracted URL
                             console.log(`📥 Downloading from: ${fileInfo.url}`);
                             const downloadResult = await this.downloadWithSessionCookies(fileInfo.url);
                             buffer = downloadResult.buffer;
                             contentType = downloadResult.contentType;
                         }
                         
-                        // Check if we got HTML instead of file
                         if (contentType.includes('text/html')) {
                             const preview = buffer.toString('utf8').substring(0, 200);
                             console.log(`⚠️ Received HTML instead of file. Preview: ${preview}`);
@@ -2292,16 +2186,13 @@ class VUMonitor {
                         console.log(`📄 File size: ${fileSizeMB.toFixed(2)} MB, Content-Type: ${contentType}`);
                         
                         if (fileSizeMB <= 100) {
-                            // Build full caption with notification details
                             let caption = `🆕 <b>فایل جدید</b>\n\n`;
                             caption += `🎓 درس: ${courseName}\n`;
                             caption += `📍 بخش: ${item.section}\n\n`;
                             caption += `📎 ${fileInfo.fileName}`;
                             
-                            // Convert HTML to Markdown for Telegram
                             const formattedCaption = this.toMarkdown(caption);
                             
-                            // Send file with full notification as caption
                             const targetChatIds = this.getCourseTargetChatIds(courseId);
                             for (const chatId of targetChatIds) {
                                 console.log(`📤 Sending file to chat ${chatId}...`);
@@ -2315,7 +2206,6 @@ class VUMonitor {
                             }
                             console.log(`✅ File uploaded: ${fileInfo.fileName}`);
                         } else {
-                            // File too large, just send link
                             message += `🔗 ${item.activity.url}\n`;
                             message += `⚠️ حجم فایل: ${fileSizeMB.toFixed(2)} MB (بیش از 100 مگابایت)\n`;
                             
@@ -2329,7 +2219,6 @@ class VUMonitor {
                             });
                         }
                     } else {
-                        // Couldn't extract file URL, send link only
                         console.log(`⚠️ Could not extract file URL for: ${item.activity.name}`);
                         message += `🔗 ${item.activity.url}\n`;
                         await this.sendTelegramMessage(message, {
@@ -2462,13 +2351,15 @@ class VUMonitor {
             }
             const gregorianDate = `${year}-${(month+1).toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`;
             const shamsiDate = this.convertToShamsi(gregorianDate);
-            // Compare by UTC day boundaries so remaining days match the UTC
-            // timestamp shown in the footer (last update time).
-            const deadlineUtc = new Date(Date.UTC(year, month, day));
-            const nowUtc = new Date();
-            nowUtc.setUTCHours(0, 0, 0, 0);
-            const diffTime = deadlineUtc.getTime() - nowUtc.getTime();
+
+            // Use local system time for day-boundary comparisons (Windows-friendly)
+            const deadlineLocal = new Date(year, month, day);
+            deadlineLocal.setHours(0, 0, 0, 0);
+            const nowLocal = new Date();
+            nowLocal.setHours(0, 0, 0, 0);
+            const diffTime = deadlineLocal.getTime() - nowLocal.getTime();
             const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+
             const dayOfWeek = new Date(year, month, day).getDay();
             const persianDayName = this.getPersianDayName(dayOfWeek);
             let formattedShamsi = shamsiDate;
@@ -2502,10 +2393,13 @@ class VUMonitor {
             };
             const month = months[monthName];
             if (month === undefined) return null;
-            const deadlineUtc = new Date(Date.UTC(year, month, day));
-            const nowUtc = new Date();
-            nowUtc.setUTCHours(0, 0, 0, 0);
-            const diffTime = deadlineUtc.getTime() - nowUtc.getTime();
+
+            // Use local system time (Windows-friendly)
+            const deadlineLocal = new Date(year, month, day);
+            deadlineLocal.setHours(0, 0, 0, 0);
+            const nowLocal = new Date();
+            nowLocal.setHours(0, 0, 0, 0);
+            const diffTime = deadlineLocal.getTime() - nowLocal.getTime();
             const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
             return diffDays > 0 ? diffDays : 0;
         } catch (error) {
@@ -2514,18 +2408,15 @@ class VUMonitor {
     }
     isInQuietHours() {
         try {
-            // Check if quiet hours is disabled via env
             if (!CONFIG.quietHoursEnabled) {
                 console.log('🕐 Quiet hours is DISABLED via QUIET_HOURS_ENABLED=false');
                 return false;
             }
             
-            // Server timezone is Asia/Tehran, use local time directly
             const now = new Date();
             const hour = now.getHours();
             const minute = now.getMinutes();
             
-            // Always log for debugging timezone issues
             console.log(`🕐 Quiet hours check - Local: ${now.toLocaleString()}, Hours: ${hour}, Minutes: ${minute}`);
             
             const totalMinutes = hour * 60 + minute;
@@ -2548,12 +2439,9 @@ class VUMonitor {
             .replace(/<br\s*\/?>/gi, '\n')
             .replace(/<[^>]*>/g, '');
     }
-    getShamsiUtcTimestamp() {
-        // Jalali date with UTC time (HH:mm) for consistent footer display.
-        return moment.utc().format('jYYYY/jMM/jDD HH:mm [UTC]');
-    }
-    getUpdateScheduleNotice() {
-        return `ℹ️ پیام ها هر ${CONFIG.checkInterval} دقیقه از طریق پورتال و ویو آپدیت خواهند شد.`;
+    // Returns local system time as a Jalali (Shamsi) timestamp — Windows-friendly
+    getLocalTimestamp() {
+        return moment().format('jYYYY/jMM/jDD HH:mm');
     }
     async sendTelegramMessage(message, options = {}) {
         try {
@@ -2611,7 +2499,7 @@ class VUMonitor {
     async checkAndSendReminders() {
         console.log('⏰ Checking for assignment reminders...');
 
-        const nowUtc = new Date(); // current UTC moment
+        const nowLocal = new Date(); // current local system time
 
         for (const [courseId, course] of Object.entries(this.courseData)) {
             for (const [sectionName, activities] of Object.entries(course.sections || {})) {
@@ -2621,14 +2509,12 @@ class VUMonitor {
                     const isQuiz = activity.type === 'quiz' || activity.type === 'mod_quiz';
                     const lastDayReminderKey = `${courseId}_${activity.url}_lastday`;
 
-                    // Already sent last-day reminder → skip
                     if (this.sentLastDayReminders[lastDayReminderKey]) {
                         console.log(`📅 Last day reminder already sent for: ${activity.name}`);
                         continue;
                     }
 
                     try {
-                        // Use cached details; only fetch if not present
                         let details = (course.assignments || {})[activity.url];
                         if (!details) {
                             details = isQuiz
@@ -2647,12 +2533,7 @@ class VUMonitor {
 
                         if (!deadlineText || deadlineText === 'نامشخص') continue;
 
-                        // ------------------------------------------------------------------
-                        // Parse deadline as UTC (matching footer timestamp convention)
-                        // Expected format: "DayName، DD MonthName YYYY، HH:MM AM/PM"
-                        // e.g. "شنبه، 23 اسفند 1404 - ساعت 23:59"  ← already formatted
-                        // Raw Moodle format: "Saturday, 14 June 2025, 11:59 PM"
-                        // ------------------------------------------------------------------
+                        // Parse deadline using local system time (Windows-friendly)
                         const rawMatch = deadlineText.match(
                             /(\w+)،\s*(\d+)\s+(\w+)\s+(\d+)،\s*(.+)/
                         );
@@ -2692,30 +2573,27 @@ class VUMonitor {
                             minutes = parseInt(timeMatch24[2]);
                         }
 
-                        // Build deadline as UTC timestamp (consistent with footer)
-                        const deadlineUtc = new Date(Date.UTC(year, month - 1, day, hours, minutes, 0));
+                        // Build deadline using local system time (Windows-friendly)
+                        const deadlineLocal = new Date(year, month - 1, day, hours, minutes, 0);
 
-                        const msUntilDeadline = deadlineUtc.getTime() - nowUtc.getTime();
+                        const msUntilDeadline = deadlineLocal.getTime() - nowLocal.getTime();
                         const hoursUntilDeadline = msUntilDeadline / (1000 * 60 * 60);
 
                         console.log(
-                            `📅 ${activity.name}: deadline UTC=${deadlineUtc.toISOString()}, ` +
-                            `now UTC=${nowUtc.toISOString()}, hoursLeft=${hoursUntilDeadline.toFixed(2)}`
+                            `📅 ${activity.name}: deadline Local=${deadlineLocal.toISOString()}, ` +
+                            `now Local=${nowLocal.toISOString()}, hoursLeft=${hoursUntilDeadline.toFixed(2)}`
                         );
 
-                        // Skip if already expired
                         if (hoursUntilDeadline <= 0) {
                             console.log(`⏭️ Skipping reminder for ${activity.name} - deadline has passed`);
                             continue;
                         }
 
-                        // Only send reminder when ≤ 24 hours remain
                         if (hoursUntilDeadline > 24) {
                             console.log(`✅ ${activity.name}: ${hoursUntilDeadline.toFixed(1)}h left, no reminder yet`);
                             continue;
                         }
 
-                        // Build reminder message
                         const dateInfo = this.formatPersianDate(deadlineText);
                         let message = `⏰ *یادآوری: مهلت ${isQuiz ? 'آزمون' : 'تکلیف'} رو به پایان است!*\n\n`;
                         message += `🎓 درس: ${course.name}\n`;
@@ -2732,7 +2610,6 @@ class VUMonitor {
                             message += `🔴 *فقط ${hoursRemaining} ساعت و ${minutesRemaining} دقیقه دیگر!*`;
                         }
 
-                        // Send to BOTH global chat AND course-specific chat
                         const targetChatIds = this.getCourseTargetChatIds(courseId, course.url);
                         console.log(`📤 Sending reminder for "${activity.name}" to chats: ${targetChatIds.join(', ')}`);
 
@@ -2745,16 +2622,14 @@ class VUMonitor {
                             }
                         });
 
-                        // Persist so we never send twice
                         const reminderRecord = {
-                            sentAt: nowUtc.toISOString(),
-                            deadline: deadlineUtc.toISOString(),
+                            sentAt: nowLocal.toISOString(),
+                            deadline: deadlineLocal.toISOString(),
                             courseName: course.name,
                             activityName: activity.name
                         };
 
                         this.sentLastDayReminders[lastDayReminderKey] = reminderRecord;
-                        // Also mark in sentReminders for backward compatibility
                         const reminderKey = `${courseId}_${activity.url}`;
                         this.sentReminders[reminderKey] = reminderRecord;
 
@@ -2779,7 +2654,7 @@ class VUMonitor {
         console.log('='.repeat(50) + '\n');
         try {
             if (this.isInQuietHours && this.isInQuietHours()) {
-                console.log('⏸️ Within quiet hours (00:30-07:30 Asia/Tehran). Skipping this check cycle.');
+                console.log('⏸️ Within quiet hours (00:30-07:30). Skipping this check cycle.');
                 return;
             }
         } catch (err) {
@@ -2886,20 +2761,12 @@ class VUMonitor {
             }
             console.log('\n✅ Check cycle completed\n');
             
-            // Clear browser cache to prevent disk usage buildup
             await this.clearBrowserCache();
             
             try {
                 await this.sendOrUpdateDeadlineOverview();
             } catch (err) {
                 console.error('Error updating deadline overview:', err.message);
-            }
-            for (const [courseId, course] of Object.entries(this.courseData)) {
-                try {
-                    await this.sendOrUpdateCourseDeadlineOverview(courseId, course);
-                } catch (err) {
-                    console.error(`Error updating course deadline overview for ${courseId}:`, err.message);
-                }
             }
             
             await this.checkAndSendReminders();
@@ -2927,6 +2794,8 @@ class VUMonitor {
     }
     async start() {
         await this.initialize();
+        // Delete any overview messages previously sent to per-course extra chats
+        await this.cleanupNonGlobalOverviewMessages();
         await this.checkAllCourses();
         console.log('⏳ Startup check completed');
         const cronExpression = `*/${CONFIG.checkInterval} * * * *`;
