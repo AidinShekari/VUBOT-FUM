@@ -201,14 +201,23 @@ class VUMonitor {
         return options;
     }
     async deleteTelegramMessage(chatId, messageId) {
-        if (!messageId) return;
+        const normalizedMessageId = this.normalizeMessageId(messageId);
+        if (normalizedMessageId === null) return 'invalid';
         try {
-            await bot.deleteMessage(chatId, messageId);
+            await bot.deleteMessage(chatId, normalizedMessageId);
+            return 'deleted';
         } catch (error) {
             const message = error?.message || '';
-            if (!message.includes('message to delete not found') && !message.includes('message cannot be deleted')) {
-                console.log(`⚠️ Could not delete message ${messageId} in chat ${chatId}:`, message);
+            if (message.includes('message to delete not found') || message.includes('message_id_invalid')) {
+                return 'not_found';
             }
+            if (message.includes('message cannot be deleted')) {
+                return 'cannot_delete';
+            }
+            if (!message.includes('message to delete not found') && !message.includes('message cannot be deleted')) {
+                console.log(`⚠️ Could not delete message ${normalizedMessageId} in chat ${chatId}:`, message);
+            }
+            return 'error';
         }
     }
     getStoredCourseMessageIds(courseId, chatId) {
@@ -411,9 +420,7 @@ class VUMonitor {
         await fs.writeFile('message_ids.json', JSON.stringify(this.courseMessageIds, null, 2));
         await fs.writeFile('reminders.json', JSON.stringify(this.sentReminders, null, 2));
         await fs.writeFile('last_day_reminders.json', JSON.stringify(this.sentLastDayReminders, null, 2));
-        if (Object.keys(this.deadlineMessageIds).length > 0) {
-            await fs.writeFile('deadline_message_id.json', JSON.stringify({ messageIds: this.deadlineMessageIds }, null, 2));
-        }
+        await fs.writeFile('deadline_message_id.json', JSON.stringify({ messageIds: this.deadlineMessageIds }, null, 2));
     }
     async login() {
         console.log('🔐 Logging in...');
@@ -1710,6 +1717,7 @@ class VUMonitor {
             const scopedOptions = this.getChatScopedOptions(baseOptions, chatId);
             const isGlobalChat = CONFIG.telegram.globalChatId
                 && key === String(CONFIG.telegram.globalChatId);
+            let keepExistingIdOnFailure = existingMessageId !== null;
 
             let chatDeadlines = allDeadlines;
             if (!isGlobalChat) {
@@ -1732,12 +1740,22 @@ class VUMonitor {
                         console.log(`✏️ Updated deadline overview message in chat ${chatId}`);
                     } catch (editError) {
                         const editMessage = editError?.message || '';
-                        if (editMessage.includes('message to edit not found') || editMessage.includes('message_id_invalid')) {
+                        if (editMessage.includes('message is not modified')) {
+                            nextDeadlineMessageIds[key] = existingMessageId;
+                            console.log(`Deadline overview message unchanged in chat ${chatId}`);
+                        } else {
+                            keepExistingIdOnFailure = false;
+                            const deleteStatus = await this.deleteTelegramMessage(chatId, existingMessageId);
+                            if (deleteStatus === 'deleted') {
+                                console.log(`Deleted previous deadline overview message ${existingMessageId} in chat ${chatId}`);
+                            } else if (deleteStatus === 'not_found') {
+                                console.log(`Previous deadline overview message ${existingMessageId} not found in chat ${chatId}; clearing stored ID`);
+                            } else if (deleteStatus === 'cannot_delete') {
+                                console.log(`Previous deadline overview message ${existingMessageId} exists in chat ${chatId} but cannot be deleted`);
+                            }
                             const sentMsg = await bot.sendMessage(chatId, formattedMessage, scopedOptions);
                             nextDeadlineMessageIds[key] = sentMsg.message_id;
-                            console.log(`📤 Sent new deadline overview message in chat ${chatId}`);
-                        } else {
-                            throw editError;
+                            console.log(`Re-sent deadline overview message in chat ${chatId} after edit error`);
                         }
                     }
                 } else {
@@ -1747,16 +1765,14 @@ class VUMonitor {
                 }
             } catch (error) {
                 console.error(`Error sending/updating deadline overview for chat ${chatId}:`, error.message);
-                if (existingMessageId !== null) {
+                if (keepExistingIdOnFailure && existingMessageId !== null) {
                     nextDeadlineMessageIds[key] = existingMessageId;
                 }
             }
         }
 
         this.deadlineMessageIds = nextDeadlineMessageIds;
-        if (Object.keys(this.deadlineMessageIds).length > 0) {
-            await fs.writeFile('deadline_message_id.json', JSON.stringify({ messageIds: this.deadlineMessageIds }, null, 2));
-        }
+        await fs.writeFile('deadline_message_id.json', JSON.stringify({ messageIds: this.deadlineMessageIds }, null, 2));
     }
     async checkForUpdates(courseId, courseName, updatedItems) {
         for (const item of updatedItems) {
