@@ -1740,9 +1740,14 @@ class VUMonitor {
                         console.log(`✏️ Updated deadline overview message in chat ${chatId}`);
                     } catch (editError) {
                         const editMessage = editError?.message || '';
+                        const missingEditTarget = editMessage.includes('message to edit not found')
+                            || editMessage.includes('message_id_invalid');
                         if (editMessage.includes('message is not modified')) {
                             nextDeadlineMessageIds[key] = existingMessageId;
                             console.log(`Deadline overview message unchanged in chat ${chatId}`);
+                        } else if (missingEditTarget) {
+                            nextDeadlineMessageIds[key] = existingMessageId;
+                            console.log(`Deadline overview message ${existingMessageId} not found in chat ${chatId}; skipping re-send`);
                         } else {
                             keepExistingIdOnFailure = false;
                             const deleteStatus = await this.deleteTelegramMessage(chatId, existingMessageId);
