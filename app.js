@@ -156,6 +156,33 @@ class VUMonitor {
 
         return Array.from(targets);
     }
+    getCourseIdsForChatId(chatId) {
+        const targetChatId = chatId === undefined || chatId === null
+            ? ''
+            : String(chatId).trim();
+        const courseIds = new Set();
+
+        if (!targetChatId) {
+            return courseIds;
+        }
+
+        for (const [key, mappedChatId] of Object.entries(CONFIG.vu.courseChatIdMap || {})) {
+            const normalizedMappedChatId = mappedChatId === undefined || mappedChatId === null
+                ? ''
+                : String(mappedChatId).trim();
+
+            if (normalizedMappedChatId !== targetChatId) {
+                continue;
+            }
+
+            const courseId = getCourseIdFromUrl(key) || String(key).trim();
+            if (courseId) {
+                courseIds.add(courseId);
+            }
+        }
+
+        return courseIds;
+    }
     normalizeMessageId(rawMessageId) {
         if (rawMessageId === undefined || rawMessageId === null) {
             return null;
@@ -1550,82 +1577,25 @@ class VUMonitor {
 
         return [part1, part2];
     }
-    async sendOrUpdateDeadlineOverview() {
-        console.log('⏰ Updating deadline overview message...');
-        
-        const allDeadlines = [];
-        
-        for (const [courseId, course] of Object.entries(this.courseData)) {
-            const assignments = course.assignments || {};
-            
-            for (const [url, details] of Object.entries(assignments)) {
-                let activityName = 'Unknown';
-                let activityType = 'assign';
-                
-                for (const [sectionName, activities] of Object.entries(course.sections || {})) {
-                    const activity = activities.find(a => a.url === url);
-                    if (activity) {
-                        activityName = activity.name;
-                        activityType = activity.type;
-                        break;
-                    }
-                }
-                
-                const isQuiz = activityType === 'quiz' || activityType === 'mod_quiz';
-                const deadlineField = isQuiz ? 'closed' : 'deadline';
-                if (details.opened && details.opened !== 'نامشخص') {
-                    const openedInfo = this.formatPersianDate(details.opened);
-                    if (openedInfo.daysRemaining !== null && openedInfo.daysRemaining > 0) {
-                        allDeadlines.push({
-                            courseName: course.name,
-                            activityName,
-                            activityType,
-                            url,
-                            dateInfo: openedInfo,
-                            isQuiz,
-                            eventType: 'opened'
-                        });
-                    }
-                }
-                if (details[deadlineField] && details[deadlineField] !== 'نامشخص') {
-                    const dateInfo = this.formatPersianDate(details[deadlineField]);
-                    if (dateInfo.daysRemaining !== null && dateInfo.daysRemaining < 0) {
-                        // skip expired
-                    } else {
-                        allDeadlines.push({
-                            courseName: course.name,
-                            activityName,
-                            activityType,
-                            url,
-                            dateInfo,
-                            isQuiz,
-                            eventType: 'deadline'
-                        });
-                    }
-                }
-            }
-        }
-        
-        allDeadlines.sort((a, b) => {
-            if (a.dateInfo.daysRemaining === null) return 1;
-            if (b.dateInfo.daysRemaining === null) return -1;
-            return a.dateInfo.daysRemaining - b.dateInfo.daysRemaining;
-        });
-        
+    buildDeadlineOverviewMessage(deadlines) {
         let message = '📃 <b>لیست رویداد ها</b>\n\n';
-        
-        if (allDeadlines.length === 0) {
+
+        if (deadlines.length === 0) {
             message += '✅ هیچ تکلیف یا آزمون فعالی وجود ندارد!\n\n';
         } else {
             const byCourse = {};
-            for (const item of allDeadlines) {
-                if (!byCourse[item.courseName]) {
-                    byCourse[item.courseName] = [];
+            for (const item of deadlines) {
+                const bucketKey = item.courseId || item.courseName;
+                if (!byCourse[bucketKey]) {
+                    byCourse[bucketKey] = {
+                        courseName: item.courseName,
+                        items: []
+                    };
                 }
-                byCourse[item.courseName].push(item);
+                byCourse[bucketKey].items.push(item);
             }
-            
-            for (const [courseName, items] of Object.entries(byCourse)) {
+
+            for (const { courseName, items } of Object.values(byCourse)) {
                 message += `📚 <b>${courseName}</b>\n\n`;
                 for (const item of items) {
                     const isQuiz = item.isQuiz;
@@ -1654,9 +1624,73 @@ class VUMonitor {
                 message += '━━━━━━━━━━━━━━━━━\n\n';
             }
         }
-        
+
         message += `🕐 آخرین به‌روزرسانی: ${this.getLocalTimestamp()}`;
-        const formattedMessage = this.toMarkdown(message);
+        return this.toMarkdown(message);
+    }
+    async sendOrUpdateDeadlineOverview() {
+        console.log('⏰ Updating deadline overview message...');
+        
+        const allDeadlines = [];
+        
+        for (const [courseId, course] of Object.entries(this.courseData)) {
+            const assignments = course.assignments || {};
+            
+            for (const [url, details] of Object.entries(assignments)) {
+                let activityName = 'Unknown';
+                let activityType = 'assign';
+                
+                for (const [sectionName, activities] of Object.entries(course.sections || {})) {
+                    const activity = activities.find(a => a.url === url);
+                    if (activity) {
+                        activityName = activity.name;
+                        activityType = activity.type;
+                        break;
+                    }
+                }
+                
+                const isQuiz = activityType === 'quiz' || activityType === 'mod_quiz';
+                const deadlineField = isQuiz ? 'closed' : 'deadline';
+                if (details.opened && details.opened !== 'نامشخص') {
+                    const openedInfo = this.formatPersianDate(details.opened);
+                    if (openedInfo.daysRemaining !== null && openedInfo.daysRemaining > 0) {
+                        allDeadlines.push({
+                            courseId: String(courseId),
+                            courseName: course.name,
+                            activityName,
+                            activityType,
+                            url,
+                            dateInfo: openedInfo,
+                            isQuiz,
+                            eventType: 'opened'
+                        });
+                    }
+                }
+                if (details[deadlineField] && details[deadlineField] !== 'نامشخص') {
+                    const dateInfo = this.formatPersianDate(details[deadlineField]);
+                    if (dateInfo.daysRemaining !== null && dateInfo.daysRemaining < 0) {
+                        // skip expired
+                    } else {
+                        allDeadlines.push({
+                            courseId: String(courseId),
+                            courseName: course.name,
+                            activityName,
+                            activityType,
+                            url,
+                            dateInfo,
+                            isQuiz,
+                            eventType: 'deadline'
+                        });
+                    }
+                }
+            }
+        }
+        
+        allDeadlines.sort((a, b) => {
+            if (a.dateInfo.daysRemaining === null) return 1;
+            if (b.dateInfo.daysRemaining === null) return -1;
+            return a.dateInfo.daysRemaining - b.dateInfo.daysRemaining;
+        });
 
         const targetChatIds = this.getDeadlineOverviewTargetChatIds();
         if (targetChatIds.length === 0) {
@@ -1674,6 +1708,17 @@ class VUMonitor {
             const key = String(chatId);
             const existingMessageId = this.normalizeMessageId(this.deadlineMessageIds[key]);
             const scopedOptions = this.getChatScopedOptions(baseOptions, chatId);
+            const isGlobalChat = CONFIG.telegram.globalChatId
+                && key === String(CONFIG.telegram.globalChatId);
+
+            let chatDeadlines = allDeadlines;
+            if (!isGlobalChat) {
+                const allowedCourseIds = this.getCourseIdsForChatId(chatId);
+                chatDeadlines = allowedCourseIds.size > 0
+                    ? allDeadlines.filter(item => allowedCourseIds.has(String(item.courseId)))
+                    : [];
+            }
+            const formattedMessage = this.buildDeadlineOverviewMessage(chatDeadlines);
 
             try {
                 if (existingMessageId !== null) {
