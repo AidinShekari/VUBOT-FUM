@@ -116,7 +116,7 @@ class VUMonitor {
         this.courseMessageIds = {};
         this.sentReminders = {};
         this.sentLastDayReminders = {};
-        this.deadlineMessageId = null;
+        this.deadlineMessageIds = {};
     }
     getCourseExtraChatId(courseId, courseUrl = '') {
         if (courseId && CONFIG.vu.courseChatIdMap[courseId]) {
@@ -137,6 +137,34 @@ class VUMonitor {
             targets.add(String(extraChatId));
         }
         return Array.from(targets);
+    }
+    getDeadlineOverviewTargetChatIds() {
+        const targets = new Set();
+
+        if (CONFIG.telegram.globalChatId) {
+            targets.add(String(CONFIG.telegram.globalChatId));
+        }
+
+        for (const chatId of Object.values(CONFIG.vu.courseChatIdMap || {})) {
+            const normalized = chatId === undefined || chatId === null
+                ? ''
+                : String(chatId).trim();
+            if (normalized) {
+                targets.add(normalized);
+            }
+        }
+
+        return Array.from(targets);
+    }
+    normalizeMessageId(rawMessageId) {
+        if (rawMessageId === undefined || rawMessageId === null) {
+            return null;
+        }
+        if (typeof rawMessageId === 'number' && Number.isFinite(rawMessageId)) {
+            return rawMessageId;
+        }
+        const parsed = parseInt(String(rawMessageId).trim(), 10);
+        return Number.isFinite(parsed) ? parsed : null;
     }
     getChatScopedOptions(baseOptions, chatId) {
         const options = { ...baseOptions };
@@ -297,11 +325,38 @@ class VUMonitor {
         }
         try {
             const deadlineMsgData = await fs.readFile('deadline_message_id.json', 'utf8');
-            this.deadlineMessageId = JSON.parse(deadlineMsgData).messageId;
-            console.log('⏰ Loaded deadline message ID');
+            const parsed = JSON.parse(deadlineMsgData);
+            this.deadlineMessageIds = {};
+
+            if (parsed && typeof parsed === 'object') {
+                if (parsed.messageIds && typeof parsed.messageIds === 'object' && !Array.isArray(parsed.messageIds)) {
+                    for (const [chatId, messageId] of Object.entries(parsed.messageIds)) {
+                        const normalizedId = this.normalizeMessageId(messageId);
+                        if (normalizedId !== null) {
+                            this.deadlineMessageIds[String(chatId)] = normalizedId;
+                        }
+                    }
+                } else if (parsed.messageId !== undefined) {
+                    // Backward compatibility with old single-message storage format.
+                    const normalizedId = this.normalizeMessageId(parsed.messageId);
+                    if (normalizedId !== null && CONFIG.telegram.globalChatId) {
+                        this.deadlineMessageIds[String(CONFIG.telegram.globalChatId)] = normalizedId;
+                    }
+                } else {
+                    // Backward compatibility in case IDs were stored as a direct chatId -> messageId map.
+                    for (const [chatId, messageId] of Object.entries(parsed)) {
+                        const normalizedId = this.normalizeMessageId(messageId);
+                        if (normalizedId !== null) {
+                            this.deadlineMessageIds[String(chatId)] = normalizedId;
+                        }
+                    }
+                }
+            }
+
+            console.log('⏰ Loaded deadline message ID(s)');
         } catch (error) {
-            console.log('⏰ No deadline message ID found');
-            this.deadlineMessageId = null;
+            console.log('⏰ No deadline message IDs found');
+            this.deadlineMessageIds = {};
         }
         
         try {
@@ -329,8 +384,8 @@ class VUMonitor {
         await fs.writeFile('message_ids.json', JSON.stringify(this.courseMessageIds, null, 2));
         await fs.writeFile('reminders.json', JSON.stringify(this.sentReminders, null, 2));
         await fs.writeFile('last_day_reminders.json', JSON.stringify(this.sentLastDayReminders, null, 2));
-        if (this.deadlineMessageId) {
-            await fs.writeFile('deadline_message_id.json', JSON.stringify({ messageId: this.deadlineMessageId }, null, 2));
+        if (Object.keys(this.deadlineMessageIds).length > 0) {
+            await fs.writeFile('deadline_message_id.json', JSON.stringify({ messageIds: this.deadlineMessageIds }, null, 2));
         }
     }
     async login() {
@@ -1602,53 +1657,60 @@ class VUMonitor {
         
         message += `🕐 آخرین به‌روزرسانی: ${this.getLocalTimestamp()}`;
         const formattedMessage = this.toMarkdown(message);
-        
-        try {
-            if (this.deadlineMessageId) {
-                const editOptions = {
-                    chat_id: CONFIG.telegram.globalChatId,
-                    message_id: this.deadlineMessageId,
-                    parse_mode: 'Markdown',
-                    disable_web_page_preview: true
-                };
-                
-                if (CONFIG.telegram.topicId) {
-                    editOptions.message_thread_id = CONFIG.telegram.topicId;
+
+        const targetChatIds = this.getDeadlineOverviewTargetChatIds();
+        if (targetChatIds.length === 0) {
+            console.log('⚠️ No chat IDs configured; skipping deadline overview');
+            return;
+        }
+
+        const baseOptions = {
+            parse_mode: 'Markdown',
+            disable_web_page_preview: true
+        };
+        const nextDeadlineMessageIds = {};
+
+        for (const chatId of targetChatIds) {
+            const key = String(chatId);
+            const existingMessageId = this.normalizeMessageId(this.deadlineMessageIds[key]);
+            const scopedOptions = this.getChatScopedOptions(baseOptions, chatId);
+
+            try {
+                if (existingMessageId !== null) {
+                    try {
+                        await bot.editMessageText(formattedMessage, {
+                            chat_id: chatId,
+                            message_id: existingMessageId,
+                            ...scopedOptions
+                        });
+                        nextDeadlineMessageIds[key] = existingMessageId;
+                        console.log(`✏️ Updated deadline overview message in chat ${chatId}`);
+                    } catch (editError) {
+                        const editMessage = editError?.message || '';
+                        if (editMessage.includes('message to edit not found') || editMessage.includes('message_id_invalid')) {
+                            const sentMsg = await bot.sendMessage(chatId, formattedMessage, scopedOptions);
+                            nextDeadlineMessageIds[key] = sentMsg.message_id;
+                            console.log(`📤 Sent new deadline overview message in chat ${chatId}`);
+                        } else {
+                            throw editError;
+                        }
+                    }
+                } else {
+                    const sentMsg = await bot.sendMessage(chatId, formattedMessage, scopedOptions);
+                    nextDeadlineMessageIds[key] = sentMsg.message_id;
+                    console.log(`📤 Sent new deadline overview message in chat ${chatId}`);
                 }
-                
-                await bot.editMessageText(formattedMessage, editOptions);
-                console.log('✏️ Updated deadline overview message');
-            } else {
-                const sendOptions = {
-                    parse_mode: 'Markdown',
-                    disable_web_page_preview: true
-                };
-                
-                if (CONFIG.telegram.topicId) {
-                    sendOptions.message_thread_id = CONFIG.telegram.topicId;
+            } catch (error) {
+                console.error(`Error sending/updating deadline overview for chat ${chatId}:`, error.message);
+                if (existingMessageId !== null) {
+                    nextDeadlineMessageIds[key] = existingMessageId;
                 }
-                
-                const sentMsg = await bot.sendMessage(CONFIG.telegram.globalChatId, formattedMessage, sendOptions);
-                this.deadlineMessageId = sentMsg.message_id;
-                await fs.writeFile('deadline_message_id.json', JSON.stringify({ messageId: this.deadlineMessageId }, null, 2));
-                console.log('📤 Sent new deadline overview message');
             }
-        } catch (error) {
-            console.error('Error sending/updating deadline overview:', error.message);
-            if (error.message.includes('message to edit not found') || error.message.includes('message_id_invalid')) {
-                const sendOptions = {
-                    parse_mode: 'Markdown',
-                    disable_web_page_preview: true
-                };
-                
-                if (CONFIG.telegram.topicId) {
-                    sendOptions.message_thread_id = CONFIG.telegram.topicId;
-                }
-                
-                const sentMsg = await bot.sendMessage(CONFIG.telegram.globalChatId, formattedMessage, sendOptions);
-                this.deadlineMessageId = sentMsg.message_id;
-                await fs.writeFile('deadline_message_id.json', JSON.stringify({ messageId: this.deadlineMessageId }, null, 2));
-            }
+        }
+
+        this.deadlineMessageIds = nextDeadlineMessageIds;
+        if (Object.keys(this.deadlineMessageIds).length > 0) {
+            await fs.writeFile('deadline_message_id.json', JSON.stringify({ messageIds: this.deadlineMessageIds }, null, 2));
         }
     }
     async checkForUpdates(courseId, courseName, updatedItems) {
