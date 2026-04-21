@@ -1808,15 +1808,16 @@ class VUMonitor {
                         continue;
                     }
                     
-                    const openedChanged = newDetails.opened !== oldDetails.opened;
-                    let deadlineChanged = newDetails.deadline !== oldDetails.deadline;
+                    const hasKnownDate = (value) => value && value !== 'نامشخص';
+                    const openedChanged = hasKnownDate(newDetails.opened) && newDetails.opened !== oldDetails.opened;
+                    let deadlineChanged = hasKnownDate(newDetails.deadline) && newDetails.deadline !== oldDetails.deadline;
                     let oldDeadlineInfo = null;
                     let newDeadlineInfo = null;
                     if (deadlineChanged) {
-                        if (oldDetails.deadline && oldDetails.deadline !== 'نامشخص') {
+                        if (hasKnownDate(oldDetails.deadline)) {
                             oldDeadlineInfo = this.formatPersianDate(oldDetails.deadline);
                         }
-                        if (newDetails.deadline && newDetails.deadline !== 'نامشخص') {
+                        if (hasKnownDate(newDetails.deadline)) {
                             newDeadlineInfo = this.formatPersianDate(newDetails.deadline);
                         }
                         if (oldDeadlineInfo && newDeadlineInfo &&
@@ -1952,15 +1953,16 @@ class VUMonitor {
                         continue;
                     }
                     
-                    const openedChanged = newDetails.opened !== oldDetails.opened;
-                    let closedChanged = newDetails.closed !== oldDetails.closed;
+                    const hasKnownDate = (value) => value && value !== 'نامشخص';
+                    const openedChanged = hasKnownDate(newDetails.opened) && newDetails.opened !== oldDetails.opened;
+                    let closedChanged = hasKnownDate(newDetails.closed) && newDetails.closed !== oldDetails.closed;
                     let oldClosedInfo = null;
                     let newClosedInfo = null;
                     if (closedChanged) {
-                        if (oldDetails.closed && oldDetails.closed !== 'نامشخص') {
+                        if (hasKnownDate(oldDetails.closed)) {
                             oldClosedInfo = this.formatPersianDate(oldDetails.closed);
                         }
-                        if (newDetails.closed && newDetails.closed !== 'نامشخص') {
+                        if (hasKnownDate(newDetails.closed)) {
                             newClosedInfo = this.formatPersianDate(newDetails.closed);
                         }
                         if (oldClosedInfo && newClosedInfo &&
