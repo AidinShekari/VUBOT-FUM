@@ -1,0 +1,19 @@
+{
+  "name": "vu-bot",
+  "version": "1.0.0",
+  "private": true,
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "axios": "^1.9.0",
+    "cron": "^4.3.3",
+    "css-select": "^5.2.2",
+    "domutils": "^3.2.2",
+    "dotenv": "^16.6.1",
+    "htmlparser2": "^10.0.0",
+    "moment-jalaali": "^0.10.4",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
