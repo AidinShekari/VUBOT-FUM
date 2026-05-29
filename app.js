@@ -40,6 +40,12 @@ const getFirstEnv = (...names) => {
     }
     return '';
 };
+const parseBoolean = (value, defaultValue = false) => {
+    if (value === undefined || value === null || String(value).trim() === '') {
+        return defaultValue;
+    }
+    return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+};
 const getObjectValue = (object, ...keys) => {
     for (const key of keys) {
         if (object[key] !== undefined && object[key] !== null && String(object[key]).trim() !== '') {
@@ -199,6 +205,7 @@ const buildPlatformConfig = (platform) => ({
     socksProxy: platform === 'telegram'
         ? getFirstEnv('TG_SOCKS_PROXY', 'TELEGRAM_SOCKS_PROXY', 'SOCKS_PROXY')
         : '',
+    pollingEnabled: parseBoolean(getPlatformEnv(platform, 'BOT_POLLING', 'POLLING', 'ENABLE_POLLING'), false),
     courseChatIdMap: COURSE_CHAT_ID_MAPS[platform] || {}
 });
 const PLATFORM_CONFIGS = {
@@ -261,7 +268,7 @@ function getBot(platform = DEFAULT_PLATFORM) {
             throw new Error(`${platformConfig.label} bot token is not configured. Set ${platform === 'telegram' ? 'TG_BOT_TOKEN' : 'BALE_BOT_TOKEN'} in .env.`);
         }
         const botOptions = {
-            polling: true,
+            polling: platformConfig.pollingEnabled,
             baseApiUrl: platformConfig.apiBaseUrl
         };
         const requestOptions = createRequestOptions(platformConfig);
@@ -269,6 +276,13 @@ function getBot(platform = DEFAULT_PLATFORM) {
             botOptions.request = requestOptions;
         }
         botInstances[platform] = new TelegramBot(platformConfig.token, botOptions);
+        if (platformConfig.pollingEnabled) {
+            botInstances[platform].on('polling_error', (error) => {
+                const message = error?.message || String(error);
+                const code = error?.code ? ` ${error.code}` : '';
+                console.error(`❌ ${platformConfig.label} polling error${code}: ${message}`);
+            });
+        }
     }
     return botInstances[platform];
 }

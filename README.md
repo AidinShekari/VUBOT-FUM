@@ -65,6 +65,7 @@ GLOBAL_CHAT_ID_BALE=your_bale_chat_id
 GLOBAL_CHAT_ID_TG=your_telegram_chat_id
 TOPIC_ID=
 ADMIN_CHAT_ID=
+BOT_POLLING=false
 ```
 
 - `BALE_BOT_TOKEN`: token for your Bale bot.
@@ -73,6 +74,7 @@ ADMIN_CHAT_ID=
 - `GLOBAL_CHAT_ID_TG`: main Telegram chat where course overviews and notifications are sent when Telegram is active.
 - `TOPIC_ID`: optional. Used when the global chat is a forum/supergroup topic.
 - `ADMIN_CHAT_ID`: optional. Reserved for admin/captcha-related flows.
+- `BOT_POLLING`: optional. Defaults to `false`; leave it disabled unless you add inbound bot handlers.
 
 ### Proxy
 
