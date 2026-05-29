@@ -44,29 +44,45 @@ Then edit `.env` with your bot token, chat IDs, VU credentials, and course list.
 
 ```env
 API_PROVIDER=BALE
-API_BASE_URL=
+BALE_API_BASE_URL=
+TG_API_BASE_URL=
 ```
 
 `API_PROVIDER` can be:
 
 - `BALE`: uses `https://tapi.bale.ai`.
 - `TELEGRAM`: uses `https://api.telegram.org`.
+- `BOTH`: sends to both Bale and Telegram, using each platform's token and chat IDs.
 
-`API_BASE_URL` is optional. Set it only if you need a custom Telegram-compatible API endpoint.
+`BALE_API_BASE_URL` and `TG_API_BASE_URL` are optional. Set them only if you need custom Telegram-compatible API endpoints.
 
 ### Bot Settings
 
 ```env
-BOT_TOKEN=your_bot_token
-GLOBAL_CHAT_ID=your_chat_id
+BALE_BOT_TOKEN=your_bale_bot_token
+TG_BOT_TOKEN=your_telegram_bot_token
+GLOBAL_CHAT_ID_BALE=your_bale_chat_id
+GLOBAL_CHAT_ID_TG=your_telegram_chat_id
 TOPIC_ID=
 ADMIN_CHAT_ID=
 ```
 
-- `BOT_TOKEN`: required. Token for your Bale or Telegram bot.
-- `GLOBAL_CHAT_ID`: main chat where course overviews and notifications are sent.
+- `BALE_BOT_TOKEN`: token for your Bale bot.
+- `TG_BOT_TOKEN`: token for your Telegram bot.
+- `GLOBAL_CHAT_ID_BALE`: main Bale chat where course overviews and notifications are sent when Bale is active.
+- `GLOBAL_CHAT_ID_TG`: main Telegram chat where course overviews and notifications are sent when Telegram is active.
 - `TOPIC_ID`: optional. Used when the global chat is a forum/supergroup topic.
 - `ADMIN_CHAT_ID`: optional. Reserved for admin/captcha-related flows.
+
+### Proxy
+
+```env
+TG_SOCKS_PROXY=socks5://user:pass@host:port
+HTTP_PROXY=
+```
+
+- `TG_SOCKS_PROXY`: optional SOCKS proxy for Telegram API requests.
+- `HTTP_PROXY`: optional HTTP proxy for bot API requests. If `TG_SOCKS_PROXY` is set, Telegram uses the SOCKS proxy.
 
 ### VU Login
 
@@ -85,7 +101,8 @@ The recommended format is JSON:
 COURSES='[
   {
     "url": "https://vu.um.ac.ir/course/view.php?id=12345",
-    "chatId": "optional_specific_chat"
+    "chatid_bale": "optional_bale_chat",
+    "chatid_tg": "optional_telegram_chat"
   }
 ]'
 ```
@@ -93,15 +110,17 @@ COURSES='[
 Each item supports:
 
 - `url`: required course URL.
-- `chatId`: optional extra chat for this specific course.
+- `chatid_bale`: optional extra Bale chat for this specific course. Legacy `chatId` is still accepted as a Bale fallback.
+- `chatid_tg`: optional extra Telegram chat for this specific course.
 
-If `chatId` is set, updates for that course are sent to both `GLOBAL_CHAT_ID` and the per-course chat.
+If the matching per-course chat is set, updates for that course are sent to both the active platform's global chat and the per-course chat. With `API_PROVIDER=BOTH`, Bale uses `chatid_bale` and Telegram uses `chatid_tg`.
 
 Legacy comma-separated config is still supported:
 
 ```env
 COURSE_URLS=https://vu.um.ac.ir/course/view.php?id=12345,https://vu.um.ac.ir/course/view.php?id=67890
-COURSE_CHAT_IDS=chat_for_first_course,chat_for_second_course
+COURSE_CHAT_IDS_BALE=bale_chat_for_first_course,bale_chat_for_second_course
+COURSE_CHAT_IDS_TG=tg_chat_for_first_course,tg_chat_for_second_course
 ```
 
 ### Other Settings
@@ -110,13 +129,11 @@ COURSE_CHAT_IDS=chat_for_first_course,chat_for_second_course
 CHECK_INTERVAL=5
 DEBUG_MODE=false
 CHROME_PATH=
-HTTP_PROXY=
 ```
 
 - `CHECK_INTERVAL`: minutes between monitoring cycles. Default is `5`.
 - `DEBUG_MODE`: enables additional debug behavior where implemented.
 - `CHROME_PATH`: currently kept for compatibility with older browser-based versions.
-- `HTTP_PROXY`: optional proxy for bot API requests.
 
 ## Running
 
@@ -196,8 +213,8 @@ Use this only when you really want GitHub history to match the new local history
 
 Check:
 
-- `BOT_TOKEN` is valid.
-- `GLOBAL_CHAT_ID` or per-course `chatId` is correct.
+- `BALE_BOT_TOKEN` and/or `TG_BOT_TOKEN` is valid for the active provider.
+- `GLOBAL_CHAT_ID_BALE`, `GLOBAL_CHAT_ID_TG`, or the per-course `chatid_bale` / `chatid_tg` is correct.
 - The bot is added to the target chat.
 - For Telegram groups, the bot has permission to send messages.
 - `COURSES` is valid JSON.

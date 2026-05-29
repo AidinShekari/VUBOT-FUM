@@ -1,5 +1,11 @@
 ﻿require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
+let SocksProxyAgent = null;
+try {
+    ({ SocksProxyAgent } = require('socks-proxy-agent'));
+} catch (error) {
+    SocksProxyAgent = null;
+}
 const { CronJob } = require('cron');
 const fs = require('fs').promises;
 const http = require('http');
@@ -9,15 +15,79 @@ const moment = require('moment-jalaali');
 const { parseDocument } = require('htmlparser2');
 const { selectAll, selectOne } = require('css-select');
 const { textContent, getAttributeValue } = require('domutils');
-const API_PROVIDER = (process.env.API_PROVIDER || process.env.TELEGRAM_API_PROVIDER || 'BALE').trim().toUpperCase();
-const API_BASE_URL = (
-    process.env.API_BASE_URL || process.env.TELEGRAM_API_BASE_URL ||
-    (API_PROVIDER === 'TELEGRAM' ? 'https://api.telegram.org' : 'https://tapi.bale.ai')
-).replace(/\/+$/, '');
+const normalizeApiProvider = (value) => {
+    const provider = (value || 'BALE').trim().toUpperCase();
+    return ['BALE', 'TELEGRAM', 'BOTH'].includes(provider) ? provider : 'BALE';
+};
+const API_PROVIDER = normalizeApiProvider(process.env.API_PROVIDER || process.env.TELEGRAM_API_PROVIDER);
+const ACTIVE_PLATFORMS = API_PROVIDER === 'BOTH'
+    ? ['bale', 'telegram']
+    : [API_PROVIDER === 'TELEGRAM' ? 'telegram' : 'bale'];
+const PLATFORM_LABELS = {
+    bale: 'Bale',
+    telegram: 'Telegram'
+};
 const parseCsv = (value) => (value || '')
     .split(',')
     .map(v => v.trim())
     .filter(Boolean);
+const getFirstEnv = (...names) => {
+    for (const name of names) {
+        const value = process.env[name];
+        if (value !== undefined && value !== null && String(value).trim() !== '') {
+            return String(value).trim();
+        }
+    }
+    return '';
+};
+const getObjectValue = (object, ...keys) => {
+    for (const key of keys) {
+        if (object[key] !== undefined && object[key] !== null && String(object[key]).trim() !== '') {
+            return String(object[key]).trim();
+        }
+    }
+    return '';
+};
+const getActiveChatPlatform = () => (API_PROVIDER === 'TELEGRAM' ? 'telegram' : 'bale');
+const getPlatformEnv = (platform, ...names) => {
+    const prefixedNames = names.flatMap(name => {
+        if (platform === 'telegram') {
+            return [`TG_${name}`, `TELEGRAM_${name}`, name];
+        }
+        return [`BALE_${name}`, name];
+    });
+    return getFirstEnv(...prefixedNames);
+};
+const normalizeCourseConfig = (item) => {
+    if (typeof item === 'string') {
+        return { url: item.trim(), chatId_bale: '', chatId_tg: '' };
+    }
+    if (!item || typeof item !== 'object') return null;
+
+    const url = typeof item.url === 'string' ? item.url.trim() : '';
+    if (!url) return null;
+
+    return {
+        url,
+        chatId_bale: getObjectValue(
+            item,
+            'chatId_bale',
+            'chatid_bale',
+            'chatIdBale',
+            'baleChatId',
+            'chatId',
+            'chatid'
+        ),
+        chatId_tg: getObjectValue(
+            item,
+            'chatId_tg',
+            'chatid_tg',
+            'chatIdTg',
+            'telegramChatId',
+            'tgChatId'
+        )
+    };
+};
 const parseCoursesFromEnv = () => {
     const raw = (process.env.COURSES || '').trim();
     if (raw) {
@@ -25,18 +95,7 @@ const parseCoursesFromEnv = () => {
             const parsed = JSON.parse(raw);
             if (!Array.isArray(parsed)) return [];
             return parsed
-                .map(item => {
-                    if (typeof item === 'string') {
-                        return { url: item.trim(), chatId: '' };
-                    }
-                    if (!item || typeof item !== 'object') return null;
-                    const url = typeof item.url === 'string' ? item.url.trim() : '';
-                    const chatId = item.chatId === undefined || item.chatId === null
-                        ? ''
-                        : String(item.chatId).trim();
-                    if (!url) return null;
-                    return { url, chatId };
-                })
+                .map(normalizeCourseConfig)
                 .filter(Boolean);
         } catch (error) {
             console.error('Invalid COURSES JSON in env:', error.message);
@@ -46,10 +105,20 @@ const parseCoursesFromEnv = () => {
 
     // Backward compatibility with old COURSE_URLS + COURSE_CHAT_IDS envs.
     const legacyUrls = parseCsv(process.env.COURSE_URLS);
-    const legacyChatIds = parseCsv(process.env.COURSE_CHAT_IDS);
+    const legacyBaleChatIds = parseCsv(
+        process.env.COURSE_CHAT_IDS_BALE ||
+        process.env.COURSE_BALE_CHAT_IDS ||
+        process.env.COURSE_CHAT_IDS
+    );
+    const legacyTelegramChatIds = parseCsv(
+        process.env.COURSE_CHAT_IDS_TG ||
+        process.env.COURSE_TG_CHAT_IDS ||
+        process.env.COURSE_TELEGRAM_CHAT_IDS
+    );
     return legacyUrls.map((url, i) => ({
         url,
-        chatId: (legacyChatIds[i] || '').trim()
+        chatId_bale: (legacyBaleChatIds[i] || '').trim(),
+        chatId_tg: (legacyTelegramChatIds[i] || '').trim()
     }));
 };
 const getCourseIdFromUrl = (url) => {
@@ -59,11 +128,12 @@ const getCourseIdFromUrl = (url) => {
         return '';
     }
 };
-const buildCourseChatIdMap = (courses) => {
+const buildCourseChatIdMap = (courses, platform = getActiveChatPlatform()) => {
     const map = {};
+    const chatIdKey = platform === 'telegram' ? 'chatId_tg' : 'chatId_bale';
     for (const course of courses) {
         const url = (course && course.url ? String(course.url) : '').trim();
-        const chatId = (course && course.chatId ? String(course.chatId) : '').trim();
+        const chatId = (course && course[chatIdKey] ? String(course[chatIdKey]) : '').trim();
         if (!url) continue;
         if (!chatId) continue;
         const courseId = getCourseIdFromUrl(url);
@@ -76,19 +146,77 @@ const buildCourseChatIdMap = (courses) => {
 };
 const COURSES = parseCoursesFromEnv();
 const COURSE_URLS = COURSES.map(c => c.url);
-const COURSE_CHAT_ID_MAP = buildCourseChatIdMap(COURSES);
+const COURSE_CHAT_ID_MAPS = {
+    bale: buildCourseChatIdMap(COURSES, 'bale'),
+    telegram: buildCourseChatIdMap(COURSES, 'telegram')
+};
+const getGlobalChatId = (platform) => platform === 'telegram'
+    ? getFirstEnv(
+        'GLOBAL_CHAT_ID_TG',
+        'GLOBAL_TG_CHAT_ID',
+        'GLOBAL_TELEGRAM_CHAT_ID',
+        'TELEGRAM_CHAT_ID',
+        'CHAT_ID_TG',
+        API_PROVIDER !== 'BOTH' ? 'GLOBAL_CHAT_ID' : '',
+        API_PROVIDER !== 'BOTH' ? 'CHAT_ID' : ''
+    )
+    : getFirstEnv(
+        'GLOBAL_CHAT_ID_BALE',
+        'GLOBAL_BALE_CHAT_ID',
+        'CHAT_ID_BALE',
+        'GLOBAL_CHAT_ID',
+        'CHAT_ID'
+    );
+const getApiBaseUrl = (platform) => {
+    const value = platform === 'telegram'
+        ? getFirstEnv(
+            'TG_API_BASE_URL',
+            'TELEGRAM_API_BASE_URL',
+            API_PROVIDER !== 'BOTH' ? 'API_BASE_URL' : ''
+        )
+        : getFirstEnv(
+            'BALE_API_BASE_URL',
+            API_PROVIDER !== 'BOTH' ? 'API_BASE_URL' : ''
+        );
+
+    return (value || (platform === 'telegram'
+        ? 'https://api.telegram.org'
+        : 'https://tapi.bale.ai')).replace(/\/+$/, '');
+};
+const buildPlatformConfig = (platform) => ({
+    name: platform,
+    label: PLATFORM_LABELS[platform],
+    token: platform === 'telegram'
+        ? getFirstEnv('TG_BOT_TOKEN', 'TELEGRAM_BOT_TOKEN', API_PROVIDER !== 'BOTH' ? 'BOT_TOKEN' : '')
+        : getFirstEnv('BALE_BOT_TOKEN', 'BOT_TOKEN'),
+    globalChatId: getGlobalChatId(platform),
+    topicId: getPlatformEnv(platform, 'TOPIC_ID')
+        ? parseInt(getPlatformEnv(platform, 'TOPIC_ID'), 10)
+        : null,
+    adminChatId: getPlatformEnv(platform, 'ADMIN_CHAT_ID'),
+    apiBaseUrl: getApiBaseUrl(platform),
+    httpProxy: getPlatformEnv(platform, 'HTTP_PROXY'),
+    socksProxy: platform === 'telegram'
+        ? getFirstEnv('TG_SOCKS_PROXY', 'TELEGRAM_SOCKS_PROXY', 'SOCKS_PROXY')
+        : '',
+    courseChatIdMap: COURSE_CHAT_ID_MAPS[platform] || {}
+});
+const PLATFORM_CONFIGS = {
+    bale: buildPlatformConfig('bale'),
+    telegram: buildPlatformConfig('telegram')
+};
+const DEFAULT_PLATFORM = getActiveChatPlatform();
 const CONFIG = {
-    telegram: {
-        token: process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN,
-        globalChatId: process.env.GLOBAL_CHAT_ID || process.env.GLOBAL_TELEGRAM_CHAT_ID || process.env.CHAT_ID || process.env.TELEGRAM_CHAT_ID,
-        topicId: (process.env.TOPIC_ID || process.env.TELEGRAM_TOPIC_ID) ? parseInt(process.env.TOPIC_ID || process.env.TELEGRAM_TOPIC_ID) : null,
-        adminChatId: process.env.ADMIN_CHAT_ID || process.env.TELEGRAM_ADMIN_CHAT_ID || ''
-    },
+    apiProvider: API_PROVIDER,
+    activePlatforms: ACTIVE_PLATFORMS,
+    platforms: PLATFORM_CONFIGS,
+    telegram: PLATFORM_CONFIGS[DEFAULT_PLATFORM],
     vu: {
         username: process.env.VU_USERNAME || process.env.VU_USER || '',
         password: process.env.VU_PASSWORD || process.env.VU_PASS || '',
         courseUrls: COURSE_URLS,
-        courseChatIdMap: COURSE_CHAT_ID_MAP
+        courseChatIdMap: COURSE_CHAT_ID_MAPS[DEFAULT_PLATFORM],
+        courseChatIdMaps: COURSE_CHAT_ID_MAPS
     },
     checkInterval: parseInt(process.env.CHECK_INTERVAL) || 5,
     debug: process.env.DEBUG_MODE === 'true' || false,
@@ -96,33 +224,54 @@ const CONFIG = {
     httpProxy: process.env.HTTP_PROXY || null,
     quietHoursEnabled: false  // true = quiet hours فعال، false = غیرفعال
 };
-if (CONFIG.httpProxy) {
-    console.log('Using Proxy:', CONFIG.httpProxy);
+for (const platform of CONFIG.activePlatforms) {
+    const platformConfig = CONFIG.platforms[platform];
+    if (platformConfig.httpProxy) {
+        console.log(`Using ${platformConfig.label} HTTP proxy`);
+    }
+    if (platformConfig.socksProxy) {
+        console.log(`Using ${platformConfig.label} SOCKS proxy`);
+    }
 }
-const botOptions = {
-    polling: true,
-    baseApiUrl: API_BASE_URL
-};
-if (CONFIG.httpProxy) {
-    botOptions.request = { proxy: CONFIG.httpProxy };
-}
-let telegramBot = null;
-function getBot() {
-    if (!telegramBot) {
-        if (!CONFIG.telegram.token) {
-            throw new Error('Bot token is not configured. Set BOT_TOKEN in .env.');
+const createRequestOptions = (platformConfig) => {
+    const requestOptions = {};
+
+    if (platformConfig.httpProxy && !platformConfig.socksProxy) {
+        requestOptions.proxy = platformConfig.httpProxy;
+    }
+
+    if (platformConfig.socksProxy) {
+        if (!SocksProxyAgent) {
+            throw new Error('SOCKS proxy support requires the socks-proxy-agent package. Run npm install first.');
         }
-        telegramBot = new TelegramBot(CONFIG.telegram.token, botOptions);
+        requestOptions.agent = new SocksProxyAgent(platformConfig.socksProxy);
+        requestOptions.tunnel = false;
     }
-    return telegramBot;
+
+    return Object.keys(requestOptions).length > 0 ? requestOptions : null;
+};
+const botInstances = {};
+function getBot(platform = DEFAULT_PLATFORM) {
+    const platformConfig = CONFIG.platforms[platform];
+    if (!platformConfig) {
+        throw new Error(`Unknown bot platform: ${platform}`);
+    }
+    if (!botInstances[platform]) {
+        if (!platformConfig.token) {
+            throw new Error(`${platformConfig.label} bot token is not configured. Set ${platform === 'telegram' ? 'TG_BOT_TOKEN' : 'BALE_BOT_TOKEN'} in .env.`);
+        }
+        const botOptions = {
+            polling: true,
+            baseApiUrl: platformConfig.apiBaseUrl
+        };
+        const requestOptions = createRequestOptions(platformConfig);
+        if (requestOptions) {
+            botOptions.request = requestOptions;
+        }
+        botInstances[platform] = new TelegramBot(platformConfig.token, botOptions);
+    }
+    return botInstances[platform];
 }
-const bot = new Proxy({}, {
-    get(_target, prop) {
-        const instance = getBot();
-        const value = instance[prop];
-        return typeof value === 'function' ? value.bind(instance) : value;
-    }
-});
 let monitor = null;
 const DATA_FILE = 'course_data.json';
 class VUMonitor {
@@ -145,45 +294,84 @@ class VUMonitor {
         this.deadlineMessageIds = {};
         this.deadlineMessageHistoryIds = {};
     }
-    getCourseExtraChatId(courseId, courseUrl = '') {
-        if (courseId && CONFIG.vu.courseChatIdMap[courseId]) {
-            return CONFIG.vu.courseChatIdMap[courseId];
+    getPlatformConfig(platform) {
+        return CONFIG.platforms[platform] || null;
+    }
+    getStorageKey(targetOrChatId, platform = DEFAULT_PLATFORM) {
+        const target = this.normalizeChatTarget(targetOrChatId, platform);
+        if (!target) return '';
+        return target.platform === 'bale'
+            ? String(target.chatId)
+            : `${target.platform}:${target.chatId}`;
+    }
+    normalizeChatTarget(targetOrChatId, platform = DEFAULT_PLATFORM) {
+        if (targetOrChatId && typeof targetOrChatId === 'object') {
+            const targetPlatform = targetOrChatId.platform || platform || DEFAULT_PLATFORM;
+            const chatId = targetOrChatId.chatId === undefined || targetOrChatId.chatId === null
+                ? ''
+                : String(targetOrChatId.chatId).trim();
+            if (!chatId) return null;
+            return { platform: targetPlatform, chatId };
         }
-        if (courseUrl && CONFIG.vu.courseChatIdMap[courseUrl]) {
-            return CONFIG.vu.courseChatIdMap[courseUrl];
+
+        const chatId = targetOrChatId === undefined || targetOrChatId === null
+            ? ''
+            : String(targetOrChatId).trim();
+        if (!chatId) return null;
+        return { platform: platform || DEFAULT_PLATFORM, chatId };
+    }
+    addTarget(targets, platform, chatId) {
+        const target = this.normalizeChatTarget({ platform, chatId });
+        if (!target) return;
+        targets.set(`${target.platform}:${target.chatId}`, target);
+    }
+    getCourseExtraChatId(courseId, courseUrl = '', platform = DEFAULT_PLATFORM) {
+        const map = CONFIG.vu.courseChatIdMaps?.[platform] || {};
+        if (courseId && map[courseId]) {
+            return map[courseId];
+        }
+        if (courseUrl && map[courseUrl]) {
+            return map[courseUrl];
         }
         return null;
     }
     getCourseTargetChatIds(courseId, courseUrl = '') {
-        const targets = new Set();
-        if (CONFIG.telegram.globalChatId) {
-            targets.add(String(CONFIG.telegram.globalChatId));
+        const targets = new Map();
+        for (const platform of CONFIG.activePlatforms) {
+            const platformConfig = this.getPlatformConfig(platform);
+            if (!platformConfig || !platformConfig.token) {
+                continue;
+            }
+            if (platformConfig.globalChatId) {
+                this.addTarget(targets, platform, platformConfig.globalChatId);
+            }
+            const extraChatId = this.getCourseExtraChatId(courseId, courseUrl, platform);
+            if (extraChatId) {
+                this.addTarget(targets, platform, extraChatId);
+            }
         }
-        const extraChatId = this.getCourseExtraChatId(courseId, courseUrl);
-        if (extraChatId) {
-            targets.add(String(extraChatId));
-        }
-        return Array.from(targets);
+        return Array.from(targets.values());
     }
     getDeadlineOverviewTargetChatIds() {
-        const targets = new Set();
+        const targets = new Map();
 
-        if (CONFIG.telegram.globalChatId) {
-            targets.add(String(CONFIG.telegram.globalChatId));
-        }
+        for (const platform of CONFIG.activePlatforms) {
+            const platformConfig = this.getPlatformConfig(platform);
+            if (!platformConfig || !platformConfig.token) {
+                continue;
+            }
+            if (platformConfig.globalChatId) {
+                this.addTarget(targets, platform, platformConfig.globalChatId);
+            }
 
-        for (const chatId of Object.values(CONFIG.vu.courseChatIdMap || {})) {
-            const normalized = chatId === undefined || chatId === null
-                ? ''
-                : String(chatId).trim();
-            if (normalized) {
-                targets.add(normalized);
+            for (const chatId of Object.values(platformConfig.courseChatIdMap || {})) {
+                this.addTarget(targets, platform, chatId);
             }
         }
 
-        return Array.from(targets);
+        return Array.from(targets.values());
     }
-    getCourseIdsForChatId(chatId) {
+    getCourseIdsForChatId(chatId, platform = DEFAULT_PLATFORM) {
         const targetChatId = chatId === undefined || chatId === null
             ? ''
             : String(chatId).trim();
@@ -193,7 +381,8 @@ class VUMonitor {
             return courseIds;
         }
 
-        for (const [key, mappedChatId] of Object.entries(CONFIG.vu.courseChatIdMap || {})) {
+        const map = CONFIG.vu.courseChatIdMaps?.[platform] || {};
+        for (const [key, mappedChatId] of Object.entries(map)) {
             const normalizedMappedChatId = mappedChatId === undefined || mappedChatId === null
                 ? ''
                 : String(mappedChatId).trim();
@@ -220,18 +409,26 @@ class VUMonitor {
         const parsed = parseInt(String(rawMessageId).trim(), 10);
         return Number.isFinite(parsed) ? parsed : null;
     }
-    getChatScopedOptions(baseOptions, chatId) {
+    getChatScopedOptions(baseOptions, targetOrChatId, platform = DEFAULT_PLATFORM) {
+        const target = this.normalizeChatTarget(targetOrChatId, platform);
+        const platformConfig = target ? this.getPlatformConfig(target.platform) : null;
         const options = { ...baseOptions };
-        if (CONFIG.telegram.topicId && String(chatId) === String(CONFIG.telegram.globalChatId)) {
-            options.message_thread_id = CONFIG.telegram.topicId;
+        if (
+            platformConfig?.topicId &&
+            target &&
+            String(target.chatId) === String(platformConfig.globalChatId)
+        ) {
+            options.message_thread_id = platformConfig.topicId;
         }
         return options;
     }
-    async deleteTelegramMessage(chatId, messageId) {
+    async deleteTelegramMessage(targetOrChatId, messageId, platform = DEFAULT_PLATFORM) {
+        const target = this.normalizeChatTarget(targetOrChatId, platform);
+        if (!target) return 'invalid';
         const normalizedMessageId = this.normalizeMessageId(messageId);
         if (normalizedMessageId === null) return 'invalid';
         try {
-            await bot.deleteMessage(chatId, normalizedMessageId);
+            await getBot(target.platform).deleteMessage(target.chatId, normalizedMessageId);
             return 'deleted';
         } catch (error) {
             const message = error?.message || '';
@@ -242,7 +439,7 @@ class VUMonitor {
                 return 'cannot_delete';
             }
             if (!message.includes('message to delete not found') && !message.includes('message cannot be deleted')) {
-                console.log(`⚠️ Could not delete message ${normalizedMessageId} in chat ${chatId}:`, message);
+                console.log(`⚠️ Could not delete message ${normalizedMessageId} in ${target.platform} chat ${target.chatId}:`, message);
             }
             return 'error';
         }
@@ -275,8 +472,8 @@ class VUMonitor {
         }
         return null;
     }
-    getStoredDeadlineMessageCandidates(chatId) {
-        const key = String(chatId);
+    getStoredDeadlineMessageCandidates(targetOrChatId, platform = DEFAULT_PLATFORM) {
+        const key = this.getStorageKey(targetOrChatId, platform);
         const candidates = [];
 
         const primaryId = this.normalizeMessageId(this.deadlineMessageIds[key]);
@@ -296,8 +493,8 @@ class VUMonitor {
 
         return candidates;
     }
-    setDeadlineMessageHistory(chatId, ids) {
-        const key = String(chatId);
+    setDeadlineMessageHistory(targetOrChatId, ids, platform = DEFAULT_PLATFORM) {
+        const key = this.getStorageKey(targetOrChatId, platform);
         const normalizedUnique = [];
         for (const rawId of ids || []) {
             const messageId = this.normalizeMessageId(rawId);
@@ -311,21 +508,23 @@ class VUMonitor {
             delete this.deadlineMessageHistoryIds[key];
         }
     }
-    registerDeadlineMessageId(chatId, messageId) {
-        const key = String(chatId);
+    registerDeadlineMessageId(targetOrChatId, messageId, platform = DEFAULT_PLATFORM) {
+        const key = this.getStorageKey(targetOrChatId, platform);
         const normalizedMessageId = this.normalizeMessageId(messageId);
         if (normalizedMessageId === null) {
             return;
         }
-        const existing = this.getStoredDeadlineMessageCandidates(chatId);
+        const existing = this.getStoredDeadlineMessageCandidates(targetOrChatId, platform);
         const merged = [normalizedMessageId, ...existing];
-        this.setDeadlineMessageHistory(chatId, merged);
+        this.setDeadlineMessageHistory(targetOrChatId, merged, platform);
         this.deadlineMessageIds[key] = normalizedMessageId;
     }
-    async findRecentDeadlineOverviewMessageIds(chatId, limit = 100) {
+    async findRecentDeadlineOverviewMessageIds(targetOrChatId, limit = 100, platform = DEFAULT_PLATFORM) {
+        const target = this.normalizeChatTarget(targetOrChatId, platform);
+        if (!target) return [];
         try {
             const boundedLimit = Math.max(1, Math.min(100, parseInt(limit, 10) || 100));
-            const updates = await bot.getUpdates({
+            const updates = await getBot(target.platform).getUpdates({
                 offset: -boundedLimit,
                 limit: boundedLimit,
                 timeout: 0
@@ -337,7 +536,7 @@ class VUMonitor {
 
             const foundIds = [];
             for (let i = updates.length - 1; i >= 0; i -= 1) {
-                const messageId = this.extractDeadlineOverviewMessageIdFromUpdate(updates[i], chatId);
+                const messageId = this.extractDeadlineOverviewMessageIdFromUpdate(updates[i], target.chatId);
                 if (messageId !== null && !foundIds.includes(messageId)) {
                     foundIds.push(messageId);
                 }
@@ -345,18 +544,20 @@ class VUMonitor {
 
             return foundIds;
         } catch (error) {
-            console.log(`Could not inspect recent updates for chat ${chatId}: ${error.message}`);
+            console.log(`Could not inspect recent updates for ${target.platform} chat ${target.chatId}: ${error.message}`);
             return [];
         }
     }
-    async cleanupDuplicateDeadlineOverviewMessages(chatId, keepMessageId, candidateIds = []) {
+    async cleanupDuplicateDeadlineOverviewMessages(targetOrChatId, keepMessageId, candidateIds = [], platform = DEFAULT_PLATFORM) {
+        const target = this.normalizeChatTarget(targetOrChatId, platform);
+        if (!target) return;
         const keepId = this.normalizeMessageId(keepMessageId);
         if (keepId === null) {
             return;
         }
 
         const toReview = [];
-        for (const rawId of [...candidateIds, ...this.getStoredDeadlineMessageCandidates(chatId)]) {
+        for (const rawId of [...candidateIds, ...this.getStoredDeadlineMessageCandidates(target)]) {
             const messageId = this.normalizeMessageId(rawId);
             if (messageId !== null && messageId !== keepId && !toReview.includes(messageId)) {
                 toReview.push(messageId);
@@ -365,20 +566,22 @@ class VUMonitor {
 
         const undeletedIds = [];
         for (const messageId of toReview) {
-            const deleteStatus = await this.deleteTelegramMessage(chatId, messageId);
+            const deleteStatus = await this.deleteTelegramMessage(target, messageId);
             if (deleteStatus === 'cannot_delete' || deleteStatus === 'error') {
                 undeletedIds.push(messageId);
             }
         }
 
-        this.setDeadlineMessageHistory(chatId, [keepId, ...undeletedIds]);
-        this.deadlineMessageIds[String(chatId)] = keepId;
+        this.setDeadlineMessageHistory(target, [keepId, ...undeletedIds]);
+        this.deadlineMessageIds[this.getStorageKey(target)] = keepId;
     }
-    getStoredCourseMessageIds(courseId, chatId) {
+    getStoredCourseMessageIds(courseId, targetOrChatId, platform = DEFAULT_PLATFORM) {
         const stored = this.courseMessageIds[courseId];
-        const key = String(chatId);
+        const target = this.normalizeChatTarget(targetOrChatId, platform);
+        const key = this.getStorageKey(target);
         if (Array.isArray(stored)) {
-            if (String(CONFIG.telegram.globalChatId) === key) {
+            const platformConfig = target ? this.getPlatformConfig(target.platform) : null;
+            if (target && String(platformConfig?.globalChatId) === String(target.chatId)) {
                 return stored;
             }
             return [];
@@ -388,13 +591,18 @@ class VUMonitor {
         }
         return [];
     }
-    setStoredCourseMessageIds(courseId, chatId, ids) {
-        const key = String(chatId);
+    setStoredCourseMessageIds(courseId, targetOrChatId, ids, platform = DEFAULT_PLATFORM) {
+        const target = this.normalizeChatTarget(targetOrChatId, platform);
+        const key = this.getStorageKey(target);
         const prev = this.courseMessageIds[courseId];
         if (!prev || Array.isArray(prev)) {
             this.courseMessageIds[courseId] = {};
-            if (Array.isArray(prev) && CONFIG.telegram.globalChatId) {
-                this.courseMessageIds[courseId][String(CONFIG.telegram.globalChatId)] = prev;
+            const platformConfig = target ? this.getPlatformConfig(target.platform) : null;
+            if (Array.isArray(prev) && platformConfig?.globalChatId) {
+                this.courseMessageIds[courseId][this.getStorageKey({
+                    platform: target.platform,
+                    chatId: platformConfig.globalChatId
+                })] = prev;
             }
         }
         this.courseMessageIds[courseId][key] = ids;
@@ -894,8 +1102,12 @@ class VUMonitor {
                 } else if (parsed.messageId !== undefined) {
                     // Backward compatibility with old single-message storage format.
                     const normalizedId = this.normalizeMessageId(parsed.messageId);
-                    if (normalizedId !== null && CONFIG.telegram.globalChatId) {
-                        this.deadlineMessageIds[String(CONFIG.telegram.globalChatId)] = normalizedId;
+                    const platformConfig = this.getPlatformConfig(DEFAULT_PLATFORM);
+                    if (normalizedId !== null && platformConfig?.globalChatId) {
+                        this.deadlineMessageIds[this.getStorageKey({
+                            platform: DEFAULT_PLATFORM,
+                            chatId: platformConfig.globalChatId
+                        })] = normalizedId;
                     }
                 } else {
                     // Backward compatibility in case IDs were stored as a direct chatId -> messageId map.
@@ -992,11 +1204,16 @@ class VUMonitor {
     }
     async waitForTelegramResponse() {
         console.log('⏳ Waiting for captcha code from Telegram...');
+        const adminPlatform = CONFIG.activePlatforms.find(platform => {
+            const platformConfig = this.getPlatformConfig(platform);
+            return platformConfig?.token && platformConfig?.adminChatId;
+        }) || DEFAULT_PLATFORM;
+        const adminConfig = this.getPlatformConfig(adminPlatform);
         
         return new Promise((resolve) => {
             const checkUpdates = async () => {
                 try {
-                    const updates = await bot.getUpdates({
+                    const updates = await getBot(adminPlatform).getUpdates({
                         offset: -1,
                         limit: 1,
                         timeout: 0
@@ -1006,11 +1223,11 @@ class VUMonitor {
                         const message = update.message;
                         
                         if (message &&
-                            message.chat.id.toString() === CONFIG.telegram.adminChatId &&
+                            message.chat.id.toString() === adminConfig.adminChatId &&
                             message.text &&
                             (Date.now() / 1000 - message.date) < 30) {
                             
-                            await bot.sendMessage(CONFIG.telegram.adminChatId, '✅ کد دریافت شد, در حال ورود...');
+                            await getBot(adminPlatform).sendMessage(adminConfig.adminChatId, '✅ کد دریافت شد, در حال ورود...');
                             resolve(message.text.trim());
                             return;
                         }
@@ -1493,10 +1710,6 @@ class VUMonitor {
                 caption: `📎 ${fileName}`
             };
             
-            if (CONFIG.telegram.topicId) {
-                sendOptions.message_thread_id = CONFIG.telegram.topicId;
-            }
-            
             if (buffer.length > 5 * 1024 * 1024) {
                 console.log(`⚠️ File too large (${(buffer.length / 1024 / 1024).toFixed(2)} MB), sending link only`);
                 await this.sendTelegramMessage(`📎 فایل خیلی بزرگ است (${(buffer.length / 1024 / 1024).toFixed(2)} MB)\n${fileName}\n🔗 ${fileUrl}`, {
@@ -1504,9 +1717,10 @@ class VUMonitor {
                 });
             } else {
                 const targetChatIds = this.getCourseTargetChatIds(courseId);
-                for (const chatId of targetChatIds) {
+                for (const target of targetChatIds) {
                     await this.sendDocumentViaApi({
-                        chatId,
+                        platform: target.platform,
+                        chatId: target.chatId,
                         buffer,
                         fileName,
                         caption: sendOptions.caption,
@@ -1565,18 +1779,26 @@ class VUMonitor {
             statusCode: response.statusCode
         };
     }
-    async sendDocumentViaApi({ chatId, buffer, fileName, caption, contentType }) {
+    async sendDocumentViaApi({ chatId, platform = DEFAULT_PLATFORM, buffer, fileName, caption, contentType }) {
+        const target = this.normalizeChatTarget({ platform, chatId });
+        if (!target) {
+            throw new Error('No valid chat ID provided for sendDocument');
+        }
+        const platformConfig = this.getPlatformConfig(target.platform);
+        if (!platformConfig?.token) {
+            throw new Error(`${PLATFORM_LABELS[target.platform] || target.platform} bot token is not configured`);
+        }
         const boundary = `----NodeBoundary${Date.now().toString(16)}`;
         const safeFileName = (fileName || 'file.bin').replace(/\"/g, '');
         const mimeType = contentType || 'application/octet-stream';
 
         const fields = [
-            { name: 'chat_id', value: String(chatId) },
+            { name: 'chat_id', value: String(target.chatId) },
             { name: 'caption', value: caption || '' }
         ];
 
-        if (CONFIG.telegram.topicId && String(chatId) === String(CONFIG.telegram.globalChatId)) {
-            fields.push({ name: 'message_thread_id', value: String(CONFIG.telegram.topicId) });
+        if (platformConfig.topicId && String(target.chatId) === String(platformConfig.globalChatId)) {
+            fields.push({ name: 'message_thread_id', value: String(platformConfig.topicId) });
         }
 
         const chunks = [];
@@ -1597,8 +1819,9 @@ class VUMonitor {
         chunks.push(Buffer.from(`\r\n--${boundary}--\r\n`));
 
         const body = Buffer.concat(chunks);
-        const endpoint = new URL(`${API_BASE_URL}/bot${CONFIG.telegram.token}/sendDocument`);
+        const endpoint = new URL(`${platformConfig.apiBaseUrl}/bot${platformConfig.token}/sendDocument`);
         const client = endpoint.protocol === 'https:' ? https : http;
+        const requestOptions = createRequestOptions(platformConfig);
 
         return await new Promise((resolve, reject) => {
             const req = client.request(endpoint, {
@@ -1607,6 +1830,7 @@ class VUMonitor {
                     'Content-Type': `multipart/form-data; boundary=${boundary}`,
                     'Content-Length': body.length
                 },
+                ...(requestOptions?.agent ? { agent: requestOptions.agent } : {}),
                 timeout: 120000
             }, (res) => {
                 const responseChunks = [];
@@ -1718,66 +1942,73 @@ class VUMonitor {
             disable_web_page_preview: true
         };
 
-        // Send overview to global chat ONLY — not to per-course extra chats
-        const globalChatId = CONFIG.telegram.globalChatId
-            ? String(CONFIG.telegram.globalChatId)
-            : null;
+        // Send overview to global chats ONLY — not to per-course extra chats.
+        const globalTargets = CONFIG.activePlatforms
+            .map(platform => {
+                const platformConfig = this.getPlatformConfig(platform);
+                if (!platformConfig?.token || !platformConfig.globalChatId) return null;
+                return { platform, chatId: String(platformConfig.globalChatId) };
+            })
+            .filter(Boolean);
 
-        if (!globalChatId) {
+        if (globalTargets.length === 0) {
             console.log(`⚠️ No global chat ID configured; skipping course overview for ${courseId}`);
             return;
         }
 
-        const chatId = globalChatId;
-        const existingIds = this.getStoredCourseMessageIds(courseId, chatId);
-        const finalIds = [];
-        const scopedOptions = this.getChatScopedOptions(baseOptions, chatId);
+        for (const target of globalTargets) {
+            const chatId = target.chatId;
+            const platformBot = getBot(target.platform);
+            const existingIds = this.getStoredCourseMessageIds(courseId, target);
+            const finalIds = [];
+            const scopedOptions = this.getChatScopedOptions(baseOptions, target);
 
-        try {
-            for (let i = 0; i < messageParts.length; i++) {
-                const part = messageParts[i];
-                const existingId = existingIds[i];
+            try {
+                for (let i = 0; i < messageParts.length; i++) {
+                    const part = messageParts[i];
+                    const existingId = existingIds[i];
 
-                if (existingId) {
-                    try {
-                        await bot.editMessageText(part, {
-                            chat_id: chatId,
-                            message_id: existingId,
-                            ...scopedOptions
-                        });
-                        finalIds.push(existingId);
-                    } catch (editErr) {
-                        if (editErr.message && editErr.message.includes('message to edit not found')) {
-                            const sentMsg = await bot.sendMessage(chatId, part, scopedOptions);
-                            finalIds.push(sentMsg.message_id);
-                        } else {
-                            throw editErr;
+                    if (existingId) {
+                        try {
+                            await platformBot.editMessageText(part, {
+                                chat_id: chatId,
+                                message_id: existingId,
+                                ...scopedOptions
+                            });
+                            finalIds.push(existingId);
+                        } catch (editErr) {
+                            if (editErr.message && editErr.message.includes('message to edit not found')) {
+                                const sentMsg = await platformBot.sendMessage(chatId, part, scopedOptions);
+                                finalIds.push(sentMsg.message_id);
+                            } else {
+                                throw editErr;
+                            }
                         }
+                    } else {
+                        const sentMsg = await platformBot.sendMessage(chatId, part, scopedOptions);
+                        finalIds.push(sentMsg.message_id);
                     }
-                } else {
-                    const sentMsg = await bot.sendMessage(chatId, part, scopedOptions);
-                    finalIds.push(sentMsg.message_id);
                 }
-            }
 
-            // Delete any extra old parts if message got shorter
-            for (const extraId of existingIds.slice(messageParts.length)) {
-                await this.deleteTelegramMessage(chatId, extraId);
-            }
+                // Delete any extra old parts if message got shorter
+                for (const extraId of existingIds.slice(messageParts.length)) {
+                    await this.deleteTelegramMessage(target, extraId);
+                }
 
-            this.setStoredCourseMessageIds(courseId, chatId, finalIds);
-        } catch (error) {
-            console.error(`Error sending/updating course overview for chat ${chatId}:`, error.message);
-            if (error.message.includes('message to edit not found')) {
-                const sentIds = [];
-                for (const part of messageParts) {
-                    const sentMsg = await bot.sendMessage(chatId, part, scopedOptions);
-                    sentIds.push(sentMsg.message_id);
+                this.setStoredCourseMessageIds(courseId, target, finalIds);
+            } catch (error) {
+                console.error(`Error sending/updating course overview for ${target.platform} chat ${chatId}:`, error.message);
+                if (error.message.includes('message to edit not found')) {
+                    const sentIds = [];
+                    for (const part of messageParts) {
+                        const sentMsg = await platformBot.sendMessage(chatId, part, scopedOptions);
+                        sentIds.push(sentMsg.message_id);
+                    }
+                    for (const existingId of existingIds) {
+                        await this.deleteTelegramMessage(target, existingId);
+                    }
+                    this.setStoredCourseMessageIds(courseId, target, sentIds);
                 }
-                for (const existingId of existingIds) {
-                    await this.deleteTelegramMessage(chatId, existingId);
-                }
-                this.setStoredCourseMessageIds(courseId, chatId, sentIds);
             }
         }
 
@@ -1786,9 +2017,13 @@ class VUMonitor {
     // ─── Startup cleanup: delete any overview messages sent to non-global chats
     // and any previously sent per-course overview messages stored in message_ids.json
     async cleanupNonGlobalOverviewMessages() {
-        const globalChatId = CONFIG.telegram.globalChatId
-            ? String(CONFIG.telegram.globalChatId)
-            : null;
+        const globalKeys = new Set(CONFIG.activePlatforms
+            .map(platform => {
+                const platformConfig = this.getPlatformConfig(platform);
+                if (!platformConfig?.globalChatId) return null;
+                return this.getStorageKey({ platform, chatId: platformConfig.globalChatId });
+            })
+            .filter(Boolean));
         let changed = false;
 
         for (const [courseId, stored] of Object.entries(this.courseMessageIds || {})) {
@@ -1798,7 +2033,7 @@ class VUMonitor {
 
             for (const [chatId, messageIds] of Object.entries(stored)) {
                 // Keep global chat messages — delete everything else
-                if (globalChatId && String(chatId) === globalChatId) {
+                if (globalKeys.has(String(chatId))) {
                     continue;
                 }
 
@@ -2014,25 +2249,28 @@ class VUMonitor {
         };
         const nextDeadlineMessageIds = {};
 
-        for (const chatId of targetChatIds) {
-            const key = String(chatId);
+        for (const target of targetChatIds) {
+            const key = this.getStorageKey(target);
+            const chatId = target.chatId;
+            const platformBot = getBot(target.platform);
+            const platformConfig = this.getPlatformConfig(target.platform);
             const existingMessageId = this.normalizeMessageId(this.deadlineMessageIds[key]);
-            const scopedOptions = this.getChatScopedOptions(baseOptions, chatId);
-            const isGlobalChat = CONFIG.telegram.globalChatId
-                && key === String(CONFIG.telegram.globalChatId);
+            const scopedOptions = this.getChatScopedOptions(baseOptions, target);
+            const isGlobalChat = platformConfig?.globalChatId
+                && String(chatId) === String(platformConfig.globalChatId);
             let keepExistingIdOnFailure = existingMessageId !== null;
 
             let chatDeadlines = allDeadlines;
             if (!isGlobalChat) {
-                const allowedCourseIds = this.getCourseIdsForChatId(chatId);
+                const allowedCourseIds = this.getCourseIdsForChatId(chatId, target.platform);
                 chatDeadlines = allowedCourseIds.size > 0
                     ? allDeadlines.filter(item => allowedCourseIds.has(String(item.courseId)))
                     : [];
             }
             const formattedMessage = this.buildDeadlineOverviewMessage(chatDeadlines);
-            const recentMatchedIds = await this.findRecentDeadlineOverviewMessageIds(chatId, 100);
+            const recentMatchedIds = await this.findRecentDeadlineOverviewMessageIds(target, 100);
             const allCandidateIds = [
-                ...this.getStoredDeadlineMessageCandidates(chatId),
+                ...this.getStoredDeadlineMessageCandidates(target),
                 ...recentMatchedIds
             ];
             const uniqueCandidateIds = [];
@@ -2051,7 +2289,7 @@ class VUMonitor {
                     let activeMessageId = editTargetId;
                     let wasEdited = false;
                     try {
-                        await bot.editMessageText(formattedMessage, {
+                        await platformBot.editMessageText(formattedMessage, {
                             chat_id: chatId,
                             message_id: activeMessageId,
                             ...scopedOptions
@@ -2068,7 +2306,7 @@ class VUMonitor {
                             const fallbackCandidates = uniqueCandidateIds.slice(1);
                             for (const fallbackId of fallbackCandidates) {
                                 try {
-                                    await bot.editMessageText(formattedMessage, {
+                                    await platformBot.editMessageText(formattedMessage, {
                                         chat_id: chatId,
                                         message_id: fallbackId,
                                         ...scopedOptions
@@ -2096,21 +2334,21 @@ class VUMonitor {
                     }
 
                     if (wasEdited) {
-                        this.registerDeadlineMessageId(chatId, activeMessageId);
-                        await this.cleanupDuplicateDeadlineOverviewMessages(chatId, activeMessageId, uniqueCandidateIds);
+                        this.registerDeadlineMessageId(target, activeMessageId);
+                        await this.cleanupDuplicateDeadlineOverviewMessages(target, activeMessageId, uniqueCandidateIds);
                         nextDeadlineMessageIds[key] = activeMessageId;
-                        console.log(`Updated deadline overview message in chat ${chatId}`);
+                        console.log(`Updated deadline overview message in ${target.platform} chat ${chatId}`);
                     } else {
-                        console.log(`Could not find an editable deadline overview message in chat ${chatId}; skipped re-send to avoid duplicates`);
+                        console.log(`Could not find an editable deadline overview message in ${target.platform} chat ${chatId}; skipped re-send to avoid duplicates`);
                     }
                 } else {
-                    const sentMsg = await bot.sendMessage(chatId, formattedMessage, scopedOptions);
-                    this.registerDeadlineMessageId(chatId, sentMsg.message_id);
+                    const sentMsg = await platformBot.sendMessage(chatId, formattedMessage, scopedOptions);
+                    this.registerDeadlineMessageId(target, sentMsg.message_id);
                     nextDeadlineMessageIds[key] = sentMsg.message_id;
-                    console.log(`Sent new deadline overview message in chat ${chatId}`);
+                    console.log(`Sent new deadline overview message in ${target.platform} chat ${chatId}`);
                 }
             } catch (error) {
-                console.error(`Error sending/updating deadline overview for chat ${chatId}:`, error.message);
+                console.error(`Error sending/updating deadline overview for ${target.platform} chat ${chatId}:`, error.message);
                 if (keepExistingIdOnFailure && existingMessageId !== null) {
                     nextDeadlineMessageIds[key] = existingMessageId;
                 }
@@ -2118,8 +2356,8 @@ class VUMonitor {
         }
 
         this.deadlineMessageIds = nextDeadlineMessageIds;
-        for (const [chatId, messageId] of Object.entries(this.deadlineMessageIds)) {
-            this.registerDeadlineMessageId(chatId, messageId);
+        for (const [key, messageId] of Object.entries(this.deadlineMessageIds)) {
+            this.registerDeadlineMessageId(key, messageId);
         }
         await fs.writeFile('deadline_message_id.json', JSON.stringify({
             messageIds: this.deadlineMessageIds,
@@ -2611,10 +2849,11 @@ class VUMonitor {
                             const formattedCaption = this.toMarkdown(caption);
                             
                             const targetChatIds = this.getCourseTargetChatIds(courseId);
-                            for (const chatId of targetChatIds) {
-                                console.log(`📤 Sending file to chat ${chatId}...`);
+                            for (const target of targetChatIds) {
+                                console.log(`📤 Sending file to ${target.platform} chat ${target.chatId}...`);
                                 await this.sendDocumentViaApi({
-                                    chatId,
+                                    platform: target.platform,
+                                    chatId: target.chatId,
                                     buffer,
                                     fileName: fileInfo.fileName,
                                     caption: formattedCaption,
@@ -2943,23 +3182,30 @@ class VUMonitor {
             };
 
             const targets = Array.isArray(chatIds) && chatIds.length > 0
-                ? chatIds.map(id => String(id))
-                : [String(CONFIG.telegram.globalChatId)];
+                ? chatIds
+                    .map(target => this.normalizeChatTarget(target))
+                    .filter(Boolean)
+                : CONFIG.activePlatforms
+                    .map(platform => {
+                        const platformConfig = this.getPlatformConfig(platform);
+                        if (!platformConfig?.token || !platformConfig.globalChatId) return null;
+                        return { platform, chatId: String(platformConfig.globalChatId) };
+                    })
+                    .filter(Boolean);
 
-            const validTargets = targets.filter(id => id && id !== 'undefined' && id !== 'null');
-            if (validTargets.length === 0) {
-                console.log('⚠️ No valid Telegram chat ID configured for this message');
+            if (targets.length === 0) {
+                console.log('⚠️ No valid chat ID configured for this message');
                 return;
             }
 
-            for (const chatId of validTargets) {
-                const sendOptions = this.getChatScopedOptions(baseOptions, chatId);
-                await bot.sendMessage(chatId, formattedMessage, sendOptions);
+            for (const target of targets) {
+                const sendOptions = this.getChatScopedOptions(baseOptions, target);
+                await getBot(target.platform).sendMessage(target.chatId, formattedMessage, sendOptions);
             }
 
-            console.log('✅ Telegram notification sent');
+            console.log('✅ Bot notification sent');
         } catch (error) {
-            console.error('❌ Failed to send Telegram message:', error.message);
+            console.error('❌ Failed to send bot message:', error.message);
         }
     }
     async sendCourseOverview(courseId) {
@@ -3100,7 +3346,7 @@ class VUMonitor {
                         }
 
                         const targetChatIds = this.getCourseTargetChatIds(courseId, course.url);
-                        console.log(`📤 Sending reminder for "${activity.name}" to chats: ${targetChatIds.join(', ')}`);
+                        console.log(`📤 Sending reminder for "${activity.name}" to chats: ${targetChatIds.map(target => `${target.platform}:${target.chatId}`).join(', ')}`);
 
                         await this.sendTelegramMessage(message, {
                             chatIds: targetChatIds,
@@ -3203,11 +3449,17 @@ class VUMonitor {
         } catch (error) {
             console.error('❌ Error during check cycle:', error.message);
             try {
-                await bot.sendMessage(
-                    CONFIG.telegram.adminChatId,
-                    this.toMarkdown(`🚨 <b>خرابی در چرخه بررسی دوره‌ها</b>\n\n${error.message}`),
-                    { parse_mode: 'Markdown' }
-                );
+                for (const platform of CONFIG.activePlatforms) {
+                    const platformConfig = this.getPlatformConfig(platform);
+                    if (!platformConfig?.token || !platformConfig.adminChatId) {
+                        continue;
+                    }
+                    await getBot(platform).sendMessage(
+                        platformConfig.adminChatId,
+                        this.toMarkdown(`🚨 <b>خرابی در چرخه بررسی دوره‌ها</b>\n\n${error.message}`),
+                        { parse_mode: 'Markdown' }
+                    );
+                }
             } catch (telegramError) {
                 console.error('Failed to send error notification:', telegramError.message);
             }
@@ -3302,7 +3554,13 @@ class VUMonitor {
     }
 }
 if (require.main === module) {
-    getBot();
+    const configuredPlatforms = CONFIG.activePlatforms.filter(platform => CONFIG.platforms[platform]?.token);
+    if (configuredPlatforms.length === 0) {
+        throw new Error('No bot token is configured. Set BALE_BOT_TOKEN and/or TG_BOT_TOKEN in .env.');
+    }
+    for (const platform of configuredPlatforms) {
+        getBot(platform);
+    }
     monitor = new VUMonitor();
     monitor.start().catch(error => {
         console.error('Fatal error:', error);
