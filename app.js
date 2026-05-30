@@ -1810,7 +1810,8 @@ class VUMonitor {
 
         const fields = [
             { name: 'chat_id', value: String(target.chatId) },
-            { name: 'caption', value: caption || '' }
+            { name: 'caption', value: caption || '' },
+            { name: 'parse_mode', value: 'Markdown' }
         ];
 
         if (platformConfig.topicId && String(target.chatId) === String(platformConfig.globalChatId)) {
@@ -2097,100 +2098,6 @@ class VUMonitor {
             historyIds: this.deadlineMessageHistoryIds
         }, null, 2));
         console.log('✅ Cleaned up per-course deadline messages');
-    }
-    async catchUpMissingNotifications() {
-        if (!CONFIG.activePlatforms.includes('telegram')) return;
-
-        console.log('🔄 Checking for assignment notifications not yet sent to Telegram...');
-        let count = 0;
-        let detailsChanged = false;
-
-        for (const [courseId, course] of Object.entries(this.courseData)) {
-            for (const [url, record] of Object.entries(course.sentNotifications || {})) {
-                const sentPlatforms = record.platforms || (record.sent ? [DEFAULT_PLATFORM] : []);
-                if (sentPlatforms.includes('telegram')) continue;
-
-                let activityName = record.activityName || 'Unknown';
-                let activityType = '';
-                let section = '';
-                for (const [sectionName, activities] of Object.entries(course.sections || {})) {
-                    const found = activities.find(a => a.url === url);
-                    if (found) {
-                        activityName = found.name;
-                        activityType = found.type;
-                        section = sectionName;
-                        break;
-                    }
-                }
-
-                const isAssignment = activityType === 'assign' || activityType === 'mod_assign';
-                if (!isAssignment) continue;
-
-                if (!this.courseData[courseId].assignments) {
-                    this.courseData[courseId].assignments = {};
-                }
-
-                let details = this.courseData[courseId].assignments[url];
-                if (!details || !details.deadline || details.deadline === 'نامشخص') {
-                    try {
-                        const fetchedDetails = await this.extractAssignmentDetails(url);
-                        if (fetchedDetails && fetchedDetails.success !== false) {
-                            details = fetchedDetails;
-                            this.courseData[courseId].assignments[url] = details;
-                            detailsChanged = true;
-                        }
-                    } catch (error) {
-                        console.error(`Error fetching catch-up assignment details for ${activityName}:`, error.message);
-                    }
-                }
-
-                const deadlineText = details?.deadline;
-                if (!deadlineText || deadlineText === 'نامشخص') continue;
-
-                const dateInfo = this.formatPersianDate(deadlineText);
-                if (dateInfo.daysRemaining === null || dateInfo.daysRemaining < 0) continue;
-
-                let message = `📝 <b>${activityName}</b>\n`;
-                message += `🎓 درس: ${course.name}\n`;
-                if (section) message += `📍 بخش: ${section}\n`;
-                message += `⏰ مهلت: ${dateInfo.formatted}\n`;
-                if (dateInfo.daysRemaining === 0) {
-                    message += `🔴 *امروز*\n`;
-                } else {
-                    message += `📅 ${dateInfo.daysRemaining} روز باقی مانده\n`;
-                }
-
-                const tgTargets = this.getCourseTargetChatIds(courseId, course.url)
-                    .filter(t => t.platform === 'telegram');
-                if (tgTargets.length === 0) continue;
-
-                try {
-                    const sendResult = await this.sendTelegramMessage(message, {
-                        chatIds: tgTargets,
-                        reply_markup: { inline_keyboard: [[{ text: '🔗 مشاهده', url }]] }
-                    });
-                    if (sendResult.sentPlatforms.includes('telegram')) {
-                        this.markNotificationSent(courseId, url, ['telegram'], activityName);
-                        await this.saveData();
-                        detailsChanged = false;
-                        count++;
-                        await new Promise(r => setTimeout(r, 1000));
-                    }
-                } catch (err) {
-                    console.error(`Error sending catch-up notification for ${activityName}:`, err.message);
-                }
-            }
-        }
-
-        if (detailsChanged) {
-            await this.saveData();
-        }
-
-        if (count > 0) {
-            console.log(`✅ Sent ${count} catch-up notification(s) to Telegram`);
-        } else {
-            console.log('✅ No missing Telegram assignment notifications found');
-        }
     }
     splitCourseOverviewMessage(message) {
         const TELEGRAM_LIMIT = 3900;
@@ -2789,6 +2696,7 @@ class VUMonitor {
                     const sentPlatforms = platformsToNotify.filter(platform => sendResult.sentPlatforms.includes(platform));
                     if (sentPlatforms.length > 0) {
                         this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                        this.recordNotificationMessageIds(courseId, item.activity.url, sendResult.sentMessages);
                     }
 
                     await this.saveData();
@@ -2808,6 +2716,7 @@ class VUMonitor {
                         const sentPlatforms = platformsToNotify.filter(platform => fallbackResult.sentPlatforms.includes(platform));
                         if (sentPlatforms.length > 0) {
                             this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                            this.recordNotificationMessageIds(courseId, item.activity.url, fallbackResult.sentMessages);
                             await this.saveData();
                         }
                     }
@@ -2893,6 +2802,7 @@ class VUMonitor {
                     const sentPlatforms = platformsToNotify.filter(platform => sendResult.sentPlatforms.includes(platform));
                     if (sentPlatforms.length > 0) {
                         this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                        this.recordNotificationMessageIds(courseId, item.activity.url, sendResult.sentMessages);
                     }
                     this.courseData[courseId].assignments[item.activity.url] = details;
 
@@ -2912,6 +2822,7 @@ class VUMonitor {
                     const sentPlatforms = platformsToNotify.filter(platform => fallbackResult.sentPlatforms.includes(platform));
                     if (sentPlatforms.length > 0) {
                         this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                        this.recordNotificationMessageIds(courseId, item.activity.url, fallbackResult.sentMessages);
                     }
                     await this.saveData();
                 }
@@ -3093,12 +3004,33 @@ class VUMonitor {
     markNotificationSent(courseId, url, platforms, activityName) {
         const existing = this.courseData[courseId].sentNotifications?.[url];
         const prevPlatforms = existing?.platforms || (existing?.sent ? [DEFAULT_PLATFORM] : []);
+        const prevMessageIds = existing?.messageIds && typeof existing.messageIds === 'object' && !Array.isArray(existing.messageIds)
+            ? { ...existing.messageIds }
+            : {};
         this.courseData[courseId].sentNotifications[url] = {
             sent: true,
             sentAt: new Date().toISOString(),
             activityName,
-            platforms: [...new Set([...prevPlatforms, ...platforms])]
+            platforms: [...new Set([...prevPlatforms, ...platforms])],
+            messageIds: prevMessageIds
         };
+    }
+    recordNotificationMessageIds(courseId, url, sentMessages = []) {
+        const record = this.courseData[courseId]?.sentNotifications?.[url];
+        if (!record) return;
+        if (!record.messageIds || typeof record.messageIds !== 'object' || Array.isArray(record.messageIds)) {
+            record.messageIds = {};
+        }
+        for (const sentMessage of sentMessages) {
+            const target = this.normalizeChatTarget(sentMessage);
+            const messageId = this.normalizeMessageId(sentMessage?.messageId);
+            if (!target || messageId === null) continue;
+            const key = this.getStorageKey(target);
+            const existing = Array.isArray(record.messageIds[key]) ? record.messageIds[key] : [];
+            if (!existing.includes(messageId)) {
+                record.messageIds[key] = [messageId, ...existing].slice(0, 20);
+            }
+        }
     }
     convertToShamsi(gregorianDate) {
         try {
@@ -3360,16 +3292,25 @@ class VUMonitor {
 
             if (targets.length === 0) {
                 console.log('⚠️ No valid chat ID configured for this message');
-                return { ok: false, sentPlatforms: [] };
+                return { ok: false, sentPlatforms: [], sentMessages: [] };
             }
 
             const sentPlatforms = [];
+            const sentMessages = [];
             let failedCount = 0;
             for (const target of targets) {
                 const sendOptions = this.getChatScopedOptions(baseOptions, target);
                 try {
-                    await getBot(target.platform).sendMessage(target.chatId, formattedMessage, sendOptions);
+                    const sentMessage = await getBot(target.platform).sendMessage(target.chatId, formattedMessage, sendOptions);
                     sentPlatforms.push(target.platform);
+                    const messageId = this.normalizeMessageId(sentMessage?.message_id);
+                    if (messageId !== null) {
+                        sentMessages.push({
+                            platform: target.platform,
+                            chatId: target.chatId,
+                            messageId
+                        });
+                    }
                 } catch (error) {
                     failedCount++;
                     console.error(`❌ Failed to send ${target.platform} bot message:`, error.message);
@@ -3378,14 +3319,14 @@ class VUMonitor {
 
             const uniqueSentPlatforms = [...new Set(sentPlatforms)];
             if (failedCount > 0) {
-                return { ok: false, sentPlatforms: uniqueSentPlatforms };
+                return { ok: false, sentPlatforms: uniqueSentPlatforms, sentMessages };
             }
 
             console.log('✅ Bot notification sent');
-            return { ok: true, sentPlatforms: uniqueSentPlatforms };
+            return { ok: true, sentPlatforms: uniqueSentPlatforms, sentMessages };
         } catch (error) {
             console.error('❌ Failed to send bot message:', error.message);
-            return { ok: false, sentPlatforms: [] };
+            return { ok: false, sentPlatforms: [], sentMessages: [] };
         }
     }
     async sendCourseOverview(courseId) {
@@ -3655,7 +3596,6 @@ class VUMonitor {
         await this.initialize();
         await this.cleanupNonGlobalOverviewMessages();
         await this.cleanupPerCourseDeadlineMessages();
-        await this.catchUpMissingNotifications();
         await this.checkAllCourses();
         console.log('⏳ Startup check completed');
         const cronExpression = `*/${CONFIG.checkInterval} * * * *`;
