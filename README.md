@@ -201,16 +201,6 @@ Or run it with systemd, Docker, or another supervisor. The important part is tha
 
 ## Common Problems
 
-### Push Rejected After Resetting History
-
-If you intentionally reset the repository history, a normal push may fail because the remote has old commits. Replace the remote branch with:
-
-```bash
-git push --force-with-lease origin main
-```
-
-Use this only when you really want GitHub history to match the new local history.
-
 ### No Notifications
 
 Check:
