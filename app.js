@@ -368,21 +368,13 @@ class VUMonitor {
     }
     getDeadlineOverviewTargetChatIds() {
         const targets = new Map();
-
         for (const platform of CONFIG.activePlatforms) {
             const platformConfig = this.getPlatformConfig(platform);
-            if (!platformConfig || !platformConfig.token) {
-                continue;
-            }
+            if (!platformConfig || !platformConfig.token) continue;
             if (platformConfig.globalChatId) {
                 this.addTarget(targets, platform, platformConfig.globalChatId);
             }
-
-            for (const chatId of Object.values(platformConfig.courseChatIdMap || {})) {
-                this.addTarget(targets, platform, chatId);
-            }
         }
-
         return Array.from(targets.values());
     }
     getCourseIdsForChatId(chatId, platform = DEFAULT_PLATFORM) {
@@ -2068,6 +2060,110 @@ class VUMonitor {
             console.log('✅ Cleaned non-global overview message IDs');
         }
     }
+    async cleanupPerCourseDeadlineMessages() {
+        const globalKeys = new Set(CONFIG.activePlatforms
+            .map(platform => {
+                const platformConfig = this.getPlatformConfig(platform);
+                if (!platformConfig?.globalChatId) return null;
+                return this.getStorageKey({ platform, chatId: platformConfig.globalChatId });
+            })
+            .filter(Boolean));
+
+        const keysToRemove = Object.keys(this.deadlineMessageIds).filter(k => !globalKeys.has(k));
+        if (keysToRemove.length === 0) return;
+
+        for (const key of keysToRemove) {
+            const messageId = this.deadlineMessageIds[key];
+            const target = key.includes(':')
+                ? { platform: key.split(':')[0], chatId: key.split(':').slice(1).join(':') }
+                : { platform: 'bale', chatId: key };
+            await this.deleteTelegramMessage(target, messageId);
+            delete this.deadlineMessageIds[key];
+            console.log(`🧹 Deleted per-course deadline message from ${target.platform} chat ${target.chatId}`);
+        }
+
+        await fs.writeFile('deadline_message_id.json', JSON.stringify({
+            messageIds: this.deadlineMessageIds,
+            historyIds: this.deadlineMessageHistoryIds
+        }, null, 2));
+        console.log('✅ Cleaned up per-course deadline messages');
+    }
+    async catchUpMissingNotifications() {
+        if (!CONFIG.activePlatforms.includes('telegram')) return;
+
+        console.log('🔄 Checking for notifications not yet sent to Telegram...');
+        let count = 0;
+
+        for (const [courseId, course] of Object.entries(this.courseData)) {
+            for (const [url, record] of Object.entries(course.sentNotifications || {})) {
+                const sentPlatforms = record.platforms || (record.sent ? [DEFAULT_PLATFORM] : []);
+                if (sentPlatforms.includes('telegram')) continue;
+
+                let activityName = record.activityName || 'Unknown';
+                let activityType = 'assign';
+                let section = '';
+                for (const [sectionName, activities] of Object.entries(course.sections || {})) {
+                    const found = activities.find(a => a.url === url);
+                    if (found) {
+                        activityName = found.name;
+                        activityType = found.type;
+                        section = sectionName;
+                        break;
+                    }
+                }
+
+                const details = (course.assignments || {})[url];
+                const isQuiz = activityType === 'quiz' || activityType === 'mod_quiz';
+                const deadlineField = isQuiz ? 'closed' : 'deadline';
+                const deadlineText = details?.[deadlineField];
+
+                if (deadlineText && deadlineText !== 'نامشخص') {
+                    const info = this.formatPersianDate(deadlineText);
+                    if (info.daysRemaining !== null && info.daysRemaining < 0) continue;
+                }
+
+                const emoji = isQuiz ? '❓' : '📝';
+                let message = `${emoji} <b>${activityName}</b>\n`;
+                message += `🎓 درس: ${course.name}\n`;
+                if (section) message += `📍 بخش: ${section}\n`;
+
+                if (deadlineText && deadlineText !== 'نامشخص') {
+                    const dateInfo = this.formatPersianDate(deadlineText);
+                    message += `⏰ ${isQuiz ? 'بسته می‌شود' : 'مهلت'}: ${dateInfo.formatted}\n`;
+                    if (dateInfo.daysRemaining !== null && dateInfo.daysRemaining >= 0) {
+                        if (dateInfo.daysRemaining === 0) {
+                            message += `🔴 *امروز*\n`;
+                        } else {
+                            message += `📅 ${dateInfo.daysRemaining} روز باقی مانده\n`;
+                        }
+                    }
+                }
+
+                const tgTargets = this.getCourseTargetChatIds(courseId, course.url)
+                    .filter(t => t.platform === 'telegram');
+                if (tgTargets.length === 0) continue;
+
+                try {
+                    await this.sendTelegramMessage(message, {
+                        chatIds: tgTargets,
+                        reply_markup: { inline_keyboard: [[{ text: '🔗 مشاهده', url }]] }
+                    });
+                    this.markNotificationSent(courseId, url, ['telegram'], activityName);
+                    await this.saveData();
+                    count++;
+                    await new Promise(r => setTimeout(r, 1000));
+                } catch (err) {
+                    console.error(`Error sending catch-up notification for ${activityName}:`, err.message);
+                }
+            }
+        }
+
+        if (count > 0) {
+            console.log(`✅ Sent ${count} catch-up notification(s) to Telegram`);
+        } else {
+            console.log('✅ No missing Telegram notifications found');
+        }
+    }
     splitCourseOverviewMessage(message) {
         const TELEGRAM_LIMIT = 3900;
 
@@ -2607,23 +2703,25 @@ class VUMonitor {
             const activityType = item.activity.type;
             
             if (activityType === 'assign' || activityType === 'mod_assign') {
-                if (this.courseData[courseId].sentNotifications[item.activity.url]) {
+                const platformsToNotify = this.getPlatformsNotYetNotified(courseId, item.activity.url);
+                if (platformsToNotify.length === 0) {
                     console.log(`📭 Notification already sent for: ${item.activity.name}`);
                     continue;
                 }
-                
+                const notifyTargets = this.getCourseTargetChatIds(courseId).filter(t => platformsToNotify.includes(t.platform));
+
                 let message = `🆕 تکلیف جدید\n\n`;
                 message += `🎓 درس: ${courseName}\n`;
                 message += `📍 بخش: ${item.section}\n\n`;
                 message += `📝 ${item.activity.name}\n\n`;
-                
+
                 try {
                     let details = await this.extractAssignmentDetails(item.activity.url);
                     if (!details || details.success === false) {
                         console.log(`⚠️ Couldn't fetch assignment details for ${item.activity.name} — sending basic notification and skipping attachments`);
                         details = { opened: 'نامشخص', deadline: 'نامشخص', attachments: [] };
                     }
-                    
+
                     let isExpired = false;
                     if (details.deadline && details.deadline !== 'نامشخص') {
                         const deadlineCheck = this.formatPersianDate(details.deadline);
@@ -2639,9 +2737,9 @@ class VUMonitor {
                         await this.saveData();
                         continue;
                     }
-                    
+
                     await this.sendTelegramMessage(message, {
-                        chatIds: this.getCourseTargetChatIds(courseId),
+                        chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [
                                 [{ text: '🔗 مشاهده تکلیف', url: item.activity.url }],
@@ -2649,31 +2747,26 @@ class VUMonitor {
                             ]
                         }
                     });
-                    
+
                     if (details.attachments && details.attachments.length > 0) {
                         console.log(`📎 Found ${details.attachments.length} attachment(s) for assignment`);
-                        
+
                         for (const att of details.attachments) {
                             await this.downloadAndSendFile(att.url, att.fileName, courseId);
                             await new Promise(r => setTimeout(r, 1000));
                         }
                     }
-                    
+
                     this.courseData[courseId].assignments[item.activity.url] = details;
-                    
-                    this.courseData[courseId].sentNotifications[item.activity.url] = {
-                        sent: true,
-                        sentAt: new Date().toISOString(),
-                        activityName: item.activity.name
-                    };
-                    
+                    this.markNotificationSent(courseId, item.activity.url, platformsToNotify, item.activity.name);
+
                     await this.saveData();
-                    
+
                 } catch (error) {
                     console.error('Error getting assignment details:', error.message);
                     if (!message.includes('مهلت:')) {
                         await this.sendTelegramMessage(message, {
-                            chatIds: this.getCourseTargetChatIds(courseId),
+                            chatIds: notifyTargets,
                             reply_markup: {
                                 inline_keyboard: [
                                     [{ text: '🔗 مشاهده تکلیف', url: item.activity.url }],
@@ -2685,16 +2778,18 @@ class VUMonitor {
                 }
             }
             else if (activityType === 'quiz' || activityType === 'mod_quiz') {
-                if (this.courseData[courseId].sentNotifications[item.activity.url]) {
+                const platformsToNotify = this.getPlatformsNotYetNotified(courseId, item.activity.url);
+                if (platformsToNotify.length === 0) {
                     console.log(`📭 Notification already sent for: ${item.activity.name}`);
                     continue;
                 }
-                
+                const notifyTargets = this.getCourseTargetChatIds(courseId).filter(t => platformsToNotify.includes(t.platform));
+
                 let message = `🆕 <b>آزمون جدید</b>\n\n`;
                 message += `🎓 درس: ${courseName}\n`;
                 message += `📍 بخش: ${item.section}\n\n`;
                 message += `❓ ${item.activity.name}\n\n`;
-                
+
                 try {
                     let details = await this.extractQuizDetails(item.activity.url);
                     if (!details || details.success === false) {
@@ -2704,7 +2799,7 @@ class VUMonitor {
                     if ((!details.opened || details.opened === 'نامشخص') && item.activity.opened) {
                         details.opened = item.activity.opened;
                     }
-                    
+
                     let isExpired = false;
                     if (details.closed && details.closed !== 'نامشخص') {
                         const closedCheck = this.formatPersianDate(details.closed);
@@ -2718,7 +2813,7 @@ class VUMonitor {
                         await this.saveData();
                         continue;
                     }
-                    
+
                     if (details.opened && details.opened !== 'نامشخص') {
                         const openedInfo = this.formatPersianDate(details.opened);
                         message += `📅 شروع آزمون: ${openedInfo.formatted}\n`;
@@ -2732,11 +2827,11 @@ class VUMonitor {
                             }
                         }
                     }
-                    
+
                     if (details.closed && details.closed !== 'نامشخص') {
                         const dateInfo = this.formatPersianDate(details.closed);
                         message += `⏰ بسته می‌شود: ${dateInfo.formatted}\n`;
-                        
+
                         if (dateInfo.daysRemaining !== null) {
                             if (dateInfo.daysRemaining === 0) {
                                 message += `🔴 <b>امروز آخرین فرصت است!</b>\n`;
@@ -2749,71 +2844,63 @@ class VUMonitor {
                             }
                         }
                     }
-                    
+
                     await this.sendTelegramMessage(message, {
-                        chatIds: this.getCourseTargetChatIds(courseId),
+                        chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [[
                                 { text: '🔗 مشاهده آزمون', url: item.activity.url }
                             ]]
                         }
                     });
-                    
-                    this.courseData[courseId].sentNotifications[item.activity.url] = {
-                        sent: true,
-                        sentAt: new Date().toISOString(),
-                        activityName: item.activity.name
-                    };
-                    
+
+                    this.markNotificationSent(courseId, item.activity.url, platformsToNotify, item.activity.name);
                     this.courseData[courseId].assignments[item.activity.url] = details;
-                    
+
                     await this.saveData();
-                    
+
                 } catch (error) {
                     console.error('Error getting quiz details:', error.message);
                     await this.sendTelegramMessage(message, {
-                        chatIds: this.getCourseTargetChatIds(courseId),
+                        chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [[
                                 { text: '🔗 مشاهده آزمون', url: item.activity.url }
                             ]]
                         }
                     });
-                    
-                    this.courseData[courseId].sentNotifications[item.activity.url] = {
-                        sent: true,
-                        sentAt: new Date().toISOString(),
-                        activityName: item.activity.name
-                    };
-                    
+
+                    this.markNotificationSent(courseId, item.activity.url, platformsToNotify, item.activity.name);
                     await this.saveData();
                 }
             }
             else if (activityType === 'resource' || activityType === 'mod_resource') {
-                if (this.courseData[courseId].sentNotifications[item.activity.url]) {
+                const platformsToNotify = this.getPlatformsNotYetNotified(courseId, item.activity.url);
+                if (platformsToNotify.length === 0) {
                     console.log(`📭 Notification already sent for: ${item.activity.name}`);
                     continue;
                 }
-                
+                const notifyTargets = this.getCourseTargetChatIds(courseId).filter(t => platformsToNotify.includes(t.platform));
+
                 let message = `🆕 <b>فایل جدید</b>\n\n`;
                 message += `🎓 درس: ${courseName}\n`;
                 message += `📍 بخش: ${item.section}\n\n`;
                 message += `📁 ${item.activity.name}\n`;
-                
+
                 try {
                     console.log(`📥 Extracting file URL for: ${item.activity.name}`);
                     console.log(`📍 Resource URL: ${item.activity.url}`);
-                    
+
                     let fileInfo = await this.extractResourceFileUrl(item.activity.url);
-                    
+
                     if (!fileInfo || !fileInfo.url) {
                         console.log(`⚠️ Could not extract file URL, trying direct download from resource URL...`);
                         try {
                             const directResult = await this.downloadWithSessionCookies(item.activity.url);
                             if (directResult && !directResult.contentType.includes('text/html')) {
                                 const fileName = item.activity.name || 'file';
-                                fileInfo = { 
-                                    url: item.activity.url, 
+                                fileInfo = {
+                                    url: item.activity.url,
                                     fileName,
                                     directBuffer: directResult.buffer,
                                     contentType: directResult.contentType
@@ -2824,13 +2911,13 @@ class VUMonitor {
                             console.log(`⚠️ Direct download failed: ${directErr.message}`);
                         }
                     }
-                    
+
                     if (fileInfo && fileInfo.url) {
                         console.log(`📥 Downloading resource file: ${fileInfo.fileName}`);
                         console.log(`🔗 File URL: ${fileInfo.url}`);
-                        
+
                         let buffer, contentType;
-                        
+
                         if (fileInfo.buffer) {
                             buffer = fileInfo.buffer;
                             contentType = fileInfo.contentType;
@@ -2844,26 +2931,25 @@ class VUMonitor {
                             buffer = downloadResult.buffer;
                             contentType = downloadResult.contentType;
                         }
-                        
+
                         if (contentType.includes('text/html')) {
                             const preview = buffer.toString('utf8').substring(0, 200);
                             console.log(`⚠️ Received HTML instead of file. Preview: ${preview}`);
                             throw new Error('Received HTML instead of file - session may have expired');
                         }
-                        
+
                         const fileSizeMB = buffer.length / (1024 * 1024);
                         console.log(`📄 File size: ${fileSizeMB.toFixed(2)} MB, Content-Type: ${contentType}`);
-                        
+
                         if (fileSizeMB <= 100) {
                             let caption = `🆕 <b>فایل جدید</b>\n\n`;
                             caption += `🎓 درس: ${courseName}\n`;
                             caption += `📍 بخش: ${item.section}\n\n`;
                             caption += `📎 ${fileInfo.fileName}`;
-                            
+
                             const formattedCaption = this.toMarkdown(caption);
-                            
-                            const targetChatIds = this.getCourseTargetChatIds(courseId);
-                            for (const target of targetChatIds) {
+
+                            for (const target of notifyTargets) {
                                 console.log(`📤 Sending file to ${target.platform} chat ${target.chatId}...`);
                                 await this.sendDocumentViaApi({
                                     platform: target.platform,
@@ -2878,9 +2964,9 @@ class VUMonitor {
                         } else {
                             message += `🔗 ${item.activity.url}\n`;
                             message += `⚠️ حجم فایل: ${fileSizeMB.toFixed(2)} MB (بیش از 100 مگابایت)\n`;
-                            
+
                             await this.sendTelegramMessage(message, {
-                                chatIds: this.getCourseTargetChatIds(courseId),
+                                chatIds: notifyTargets,
                                 reply_markup: {
                                     inline_keyboard: [[
                                         { text: '🔗 دانلود فایل', url: item.activity.url }
@@ -2892,7 +2978,7 @@ class VUMonitor {
                         console.log(`⚠️ Could not extract file URL for: ${item.activity.name}`);
                         message += `🔗 ${item.activity.url}\n`;
                         await this.sendTelegramMessage(message, {
-                            chatIds: this.getCourseTargetChatIds(courseId),
+                            chatIds: notifyTargets,
                             reply_markup: {
                                 inline_keyboard: [[
                                     { text: '🔗 دانلود فایل', url: item.activity.url }
@@ -2904,7 +2990,7 @@ class VUMonitor {
                     console.error(`❌ Error downloading resource file: ${error.message}`);
                     message += `🔗 ${item.activity.url}\n`;
                     await this.sendTelegramMessage(message, {
-                        chatIds: this.getCourseTargetChatIds(courseId),
+                        chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [[
                                 { text: '🔗 دانلود فایل', url: item.activity.url }
@@ -2912,15 +2998,10 @@ class VUMonitor {
                         }
                     });
                 }
-                
-                this.courseData[courseId].sentNotifications[item.activity.url] = {
-                    sent: true,
-                    sentAt: new Date().toISOString(),
-                    activityName: item.activity.name
-                };
-                
+
+                this.markNotificationSent(courseId, item.activity.url, platformsToNotify, item.activity.name);
                 await this.saveData();
-                
+
                 console.log(`📁 Notified about new file: ${item.activity.name}`);
             }
         }
@@ -2946,8 +3027,24 @@ class VUMonitor {
             'folder': '📂',
             'label': '🏷️'
         };
-        
+
         return emojiMap[activityType] || '📌';
+    }
+    getPlatformsNotYetNotified(courseId, url) {
+        const record = this.courseData[courseId]?.sentNotifications?.[url];
+        if (!record) return [...CONFIG.activePlatforms];
+        const sentPlatforms = record.platforms || (record.sent ? [DEFAULT_PLATFORM] : []);
+        return CONFIG.activePlatforms.filter(p => !sentPlatforms.includes(p));
+    }
+    markNotificationSent(courseId, url, platforms, activityName) {
+        const existing = this.courseData[courseId].sentNotifications?.[url];
+        const prevPlatforms = existing?.platforms || (existing?.sent ? [DEFAULT_PLATFORM] : []);
+        this.courseData[courseId].sentNotifications[url] = {
+            sent: true,
+            sentAt: new Date().toISOString(),
+            activityName,
+            platforms: [...new Set([...prevPlatforms, ...platforms])]
+        };
     }
     convertToShamsi(gregorianDate) {
         try {
@@ -3487,8 +3584,9 @@ class VUMonitor {
     }
     async start() {
         await this.initialize();
-        // Delete any overview messages previously sent to per-course extra chats
         await this.cleanupNonGlobalOverviewMessages();
+        await this.cleanupPerCourseDeadlineMessages();
+        await this.catchUpMissingNotifications();
         await this.checkAllCourses();
         console.log('⏳ Startup check completed');
         const cronExpression = `*/${CONFIG.checkInterval} * * * *`;
