@@ -755,10 +755,43 @@ class VUMonitor {
         }
     }
     nodeText(node) {
-        return node ? textContent(node).replace(/\s+/g, ' ').trim() : '';
+        return node ? this.cleanText(textContent(node)).replace(/\s+/g, ' ').trim() : '';
     }
     nodeAttr(node, attr) {
         return node ? (getAttributeValue(node, attr) || '') : '';
+    }
+    cleanText(value = '') {
+        let text = String(value || '');
+        text = this.fixMojibake(text);
+        return text
+            .normalize('NFC')
+            .replace(/\uFEFF/g, '')
+            .trim();
+    }
+    fixMojibake(value = '') {
+        const text = String(value || '');
+        if (!/[ÃÂØÙÛ]|[\u0080-\u009F]/.test(text)) {
+            return text;
+        }
+
+        try {
+            const candidate = Buffer.from(text, 'latin1').toString('utf8');
+            const score = (s) => {
+                const persianChars = (s.match(/[\u0600-\u06FF]/g) || []).length;
+                const mojibakeMarks = (s.match(/[ÃÂØÙÛ]|[\u0080-\u009F]/g) || []).length;
+                const replacementChars = (s.match(/\uFFFD/g) || []).length;
+                return persianChars - (mojibakeMarks * 2) - (replacementChars * 4);
+            };
+
+            return score(candidate) > score(text) ? candidate : text;
+        } catch (error) {
+            return text;
+        }
+    }
+    toEnglishDigits(value = '') {
+        return String(value || '')
+            .replace(/[۰-۹]/g, digit => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(digit)))
+            .replace(/[٠-٩]/g, digit => String('٠١٢٣٤٥٦٧٨٩'.indexOf(digit)));
     }
     addWeekdayToEnglishDate(dateText) {
         const match = String(dateText || '').trim().match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})،\s*(.+)$/);
@@ -1506,7 +1539,7 @@ class VUMonitor {
             const page = await this.fetchHtmlPage(resourceUrl, { timeout: 60000 });
             const currentUrl = page.finalUrl;
             if (currentUrl.includes('pluginfile.php')) {
-                const fileName = decodeURIComponent(currentUrl.split('/').pop().split('?')[0]);
+                const fileName = this.cleanText(decodeURIComponent(currentUrl.split('/').pop().split('?')[0]));
                 return { url: currentUrl, fileName };
             }
 
@@ -1518,21 +1551,21 @@ class VUMonitor {
 
             if (resourceLink) {
                 const url = this.absoluteUrl(this.nodeAttr(resourceLink, 'href'), currentUrl);
-                const fileName = this.nodeText(resourceLink) || decodeURIComponent(url.split('/').pop().split('?')[0]);
+                const fileName = this.nodeText(resourceLink) || this.cleanText(decodeURIComponent(url.split('/').pop().split('?')[0]));
                 return { url, fileName };
             }
 
             const objectTag = this.queryOne(document, 'object[data*="pluginfile.php"]');
             if (objectTag) {
                 const url = this.absoluteUrl(this.nodeAttr(objectTag, 'data'), currentUrl);
-                const fileName = decodeURIComponent(url.split('/').pop().split('?')[0]);
+                const fileName = this.cleanText(decodeURIComponent(url.split('/').pop().split('?')[0]));
                 return { url, fileName };
             }
 
             const iframeTag = this.queryOne(document, 'iframe[src*="pluginfile.php"]');
             if (iframeTag) {
                 const url = this.absoluteUrl(this.nodeAttr(iframeTag, 'src'), currentUrl);
-                const fileName = decodeURIComponent(url.split('/').pop().split('?')[0]);
+                const fileName = this.cleanText(decodeURIComponent(url.split('/').pop().split('?')[0]));
                 return { url, fileName };
             }
 
@@ -1570,10 +1603,10 @@ class VUMonitor {
                 const contentDisposition = String(headers['content-disposition'] || '');
 
                 if (!contentType.includes('text/html')) {
-                    let fileName = decodeURIComponent(startUrl.split('/').pop().split('?')[0]);
+                    let fileName = this.cleanText(decodeURIComponent(startUrl.split('/').pop().split('?')[0]));
                     const filenameMatch = contentDisposition.match(/filename[*]?=['"]?(?:UTF-8'')?([^'";]+)/i);
                     if (filenameMatch) {
-                        fileName = decodeURIComponent(filenameMatch[1].trim());
+                        fileName = this.cleanText(decodeURIComponent(filenameMatch[1].trim()));
                     }
 
                     console.log(`✅ Found file: ${fileName} (${contentType})`);
@@ -1630,8 +1663,9 @@ class VUMonitor {
                     const url = this.absoluteUrl(this.nodeAttr(link, 'href'), page.finalUrl);
                     let fileName = this.nodeText(link);
                     if (!fileName) {
-                        fileName = decodeURIComponent(url.split('/').pop().split('?')[0]);
+                        fileName = this.cleanText(decodeURIComponent(url.split('/').pop().split('?')[0]));
                     }
+                    fileName = this.cleanText(fileName);
 
                     const exists = attachments.find(item => item.url === url);
                     const isValidFile = url && fileName &&
@@ -1698,7 +1732,7 @@ class VUMonitor {
             console.log(`✅ Downloaded file size: ${(buffer.length / 1024 / 1024).toFixed(2)} MB`);
             
             const normalizeDuplicateExtension = (name) => {
-                let n = (name || '').trim();
+                let n = this.cleanText(name || '');
                 n = n.normalize('NFC').replace(/[\u200B-\u200D\uFEFF]/g, '');
                 n = n.replace(/\s*\.\s*/g, '.').replace(/\.+/g, '.');
                 n = n.replace(/[\s\.]+$/g, '').replace(/^\s+/g, '');
@@ -2645,10 +2679,7 @@ class VUMonitor {
                 }
                 const notifyTargets = this.getCourseTargetChatIds(courseId).filter(t => platformsToNotify.includes(t.platform));
 
-                let message = `🆕 تکلیف جدید\n\n`;
-                message += `🎓 درس: ${courseName}\n`;
-                message += `📍 بخش: ${item.section}\n\n`;
-                message += `📝 ${item.activity.name}\n\n`;
+                let message = this.buildNewAssignmentMessage(courseName, item.section, item.activity.name);
 
                 try {
                     let details = await this.extractAssignmentDetails(item.activity.url);
@@ -2672,6 +2703,8 @@ class VUMonitor {
                         await this.saveData();
                         continue;
                     }
+
+                    message = this.buildNewAssignmentMessage(courseName, item.section, item.activity.name, details);
 
                     const sendResult = await this.sendTelegramMessage(message, {
                         chatIds: notifyTargets,
@@ -3072,10 +3105,63 @@ class VUMonitor {
         
         return persianMonths[monthNumber] || '';
     }
+    getPersianMonthNumber(monthName = '') {
+        const normalized = this.cleanText(monthName)
+            .replace(/ي/g, 'ی')
+            .replace(/ك/g, 'ک');
+        const persianMonths = {
+            'فروردین': 1,
+            'اردیبهشت': 2,
+            'خرداد': 3,
+            'تیر': 4,
+            'مرداد': 5,
+            'شهریور': 6,
+            'مهر': 7,
+            'آبان': 8,
+            'آذر': 9,
+            'دی': 10,
+            'بهمن': 11,
+            'اسفند': 12
+        };
+
+        return persianMonths[normalized];
+    }
+    getDateDiffDays(date) {
+        const targetLocal = new Date(date);
+        targetLocal.setHours(0, 0, 0, 0);
+        const nowLocal = new Date();
+        nowLocal.setHours(0, 0, 0, 0);
+        const diffTime = targetLocal.getTime() - nowLocal.getTime();
+        return Math.round(diffTime / (1000 * 60 * 60 * 24));
+    }
+    parsePersianMoodleDateTime(dateText) {
+        const text = this.toEnglishDigits(this.cleanText(dateText)).replace(/\s+/g, ' ').trim();
+        const match = text.match(/(\d{1,2})\s+([\u0600-\u06FF]+)\s+(\d{4})(?:\s*(?:[،,]|-)?\s*(?:ساعت)?\s*(\d{1,2}):(\d{2}))?/);
+        if (!match) return null;
+
+        const day = parseInt(match[1], 10);
+        const month = this.getPersianMonthNumber(match[2]);
+        const year = parseInt(match[3], 10);
+        const hours = match[4] !== undefined ? parseInt(match[4], 10) : 23;
+        const minutes = match[5] !== undefined ? parseInt(match[5], 10) : 59;
+        if (!month) return null;
+
+        const parsed = moment(
+            `${year}/${month}/${day} ${hours}:${minutes}`,
+            'jYYYY/jM/jD H:m',
+            true
+        );
+
+        return parsed.isValid() ? parsed.toDate() : null;
+    }
     parseMoodleDateTime(dateText) {
         if (!dateText || dateText === 'نامشخص') return null;
 
-        const match = String(dateText).match(/(\w+)[،,]\s*(\d+)\s+(\w+)\s+(\d+)[،,]\s*(.+)/);
+        const persianDate = this.parsePersianMoodleDateTime(dateText);
+        if (persianDate) return persianDate;
+
+        const cleanDateText = this.toEnglishDigits(this.cleanText(dateText));
+        const match = cleanDateText.match(/(\w+)[،,]\s*(\d+)\s+(\w+)\s+(\d+)[،,]\s*(.+)/);
         if (!match) return null;
 
         const day = parseInt(match[2], 10);
@@ -3144,10 +3230,62 @@ class VUMonitor {
             url: `https://calendar.google.com/calendar/render?${params.toString()}`
         };
     }
+    buildDaysRemainingLine(daysRemaining) {
+        if (daysRemaining === null || daysRemaining === undefined) return '';
+        if (daysRemaining < 0) return `❌ مهلت گذشته است! (${Math.abs(daysRemaining)} روز پیش)\n`;
+        if (daysRemaining === 0) return `🔴 امروز آخرین مهلت است!\n`;
+        if (daysRemaining === 1) return `⚠️ فقط 1 روز باقی مانده\n`;
+        if (daysRemaining <= 3) return `⚠️ ${daysRemaining} روز دیگر\n`;
+        return `✅ ${daysRemaining} روز دیگر\n`;
+    }
+    buildNewAssignmentMessage(courseName, sectionName, activityName, details = {}) {
+        let message = `🆕 تکلیف جدید\n\n`;
+        message += `🎓 درس: ${courseName}\n`;
+        message += `📍 بخش: ${sectionName}\n\n`;
+        message += `📝 ${activityName}\n\n`;
+
+        if (details.opened && details.opened !== 'نامشخص') {
+            const openedInfo = this.formatPersianDate(details.opened);
+            message += `📅 باز شده: ${openedInfo.formatted}\n`;
+        }
+
+        if (details.deadline && details.deadline !== 'نامشخص') {
+            const deadlineInfo = this.formatPersianDate(details.deadline);
+            message += `⏰ مهلت: ${deadlineInfo.formatted}\n`;
+            message += this.buildDaysRemainingLine(deadlineInfo.daysRemaining);
+        }
+
+        if (details.attachments && details.attachments.length > 0) {
+            message += `\n📎 فایل‌های ضمیمه:\n`;
+            for (const att of details.attachments) {
+                message += `📄 ${this.cleanText(att.fileName)}\n`;
+            }
+        }
+
+        return message;
+    }
     formatPersianDate(deadlineText) {
         try {
-            const match = deadlineText.match(/(\w+)،\s*(\d+)\s+(\w+)\s+(\d+)،\s*(.+)/);
-            if (!match) return { formatted: deadlineText, daysRemaining: null };
+            const cleanDeadlineText = this.toEnglishDigits(this.cleanText(deadlineText));
+            const persianDate = this.parsePersianMoodleDateTime(cleanDeadlineText);
+            if (persianDate) {
+                const shamsiDate = moment(persianDate).format('jYYYY/jMM/jDD');
+                const shamsiParts = shamsiDate.split('/');
+                const shamsiMonth = this.getPersianMonthName(parseInt(shamsiParts[1], 10));
+                const persianDayName = this.getPersianDayName(persianDate.getDay());
+                const hours = String(persianDate.getHours()).padStart(2, '0');
+                const minutes = String(persianDate.getMinutes()).padStart(2, '0');
+                const formattedShamsi = `${parseInt(shamsiParts[2], 10)} ${shamsiMonth} ${shamsiParts[0]}`;
+
+                return {
+                    formatted: `${persianDayName}، ${formattedShamsi} - ساعت ${hours}:${minutes}`,
+                    daysRemaining: this.getDateDiffDays(persianDate),
+                    shamsiDate
+                };
+            }
+
+            const match = cleanDeadlineText.match(/(\w+)،\s*(\d+)\s+(\w+)\s+(\d+)،\s*(.+)/);
+            if (!match) return { formatted: cleanDeadlineText, daysRemaining: null };
             const day = parseInt(match[2]);
             const monthName = match[3];
             const year = parseInt(match[4]);
@@ -3201,7 +3339,7 @@ class VUMonitor {
             };
         } catch (error) {
             console.error('Error formatting date:', error.message);
-            return { formatted: deadlineText, daysRemaining: null };
+            return { formatted: this.cleanText(deadlineText), daysRemaining: null };
         }
     }
     calculateDaysRemaining(deadlineText) {
