@@ -189,6 +189,13 @@ const getApiBaseUrl = (platform) => {
         ? 'https://api.telegram.org'
         : 'https://tapi.bale.ai')).replace(/\/+$/, '');
 };
+const normalizeSocksProxyUrl = (proxyUrl, platform) => {
+    if (!proxyUrl) return '';
+    if (platform === 'telegram' && proxyUrl.toLowerCase().startsWith('socks5://')) {
+        return `socks5h://${proxyUrl.slice('socks5://'.length)}`;
+    }
+    return proxyUrl;
+};
 const buildPlatformConfig = (platform) => ({
     name: platform,
     label: PLATFORM_LABELS[platform],
@@ -203,7 +210,7 @@ const buildPlatformConfig = (platform) => ({
     apiBaseUrl: getApiBaseUrl(platform),
     httpProxy: getPlatformEnv(platform, 'HTTP_PROXY'),
     socksProxy: platform === 'telegram'
-        ? getFirstEnv('TG_SOCKS_PROXY', 'TELEGRAM_SOCKS_PROXY', 'SOCKS_PROXY')
+        ? normalizeSocksProxyUrl(getFirstEnv('TG_SOCKS_PROXY', 'TELEGRAM_SOCKS_PROXY', 'SOCKS_PROXY'), platform)
         : '',
     pollingEnabled: parseBoolean(getPlatformEnv(platform, 'BOT_POLLING', 'POLLING', 'ENABLE_POLLING'), false),
     courseChatIdMap: COURSE_CHAT_ID_MAPS[platform] || {}
@@ -233,11 +240,13 @@ const CONFIG = {
 };
 for (const platform of CONFIG.activePlatforms) {
     const platformConfig = CONFIG.platforms[platform];
-    if (platformConfig.httpProxy) {
-        console.log(`Using ${platformConfig.label} HTTP proxy`);
-    }
     if (platformConfig.socksProxy) {
         console.log(`Using ${platformConfig.label} SOCKS proxy`);
+        if (platformConfig.httpProxy) {
+            console.log(`Ignoring ${platformConfig.label} HTTP proxy because SOCKS proxy is configured`);
+        }
+    } else if (platformConfig.httpProxy) {
+        console.log(`Using ${platformConfig.label} HTTP proxy`);
     }
 }
 const createRequestOptions = (platformConfig) => {
@@ -251,6 +260,7 @@ const createRequestOptions = (platformConfig) => {
         if (!SocksProxyAgent) {
             throw new Error('SOCKS proxy support requires the socks-proxy-agent package. Run npm install first.');
         }
+        requestOptions.proxy = null;
         requestOptions.agent = new SocksProxyAgent(platformConfig.socksProxy);
         requestOptions.tunnel = false;
     }
@@ -2091,8 +2101,9 @@ class VUMonitor {
     async catchUpMissingNotifications() {
         if (!CONFIG.activePlatforms.includes('telegram')) return;
 
-        console.log('🔄 Checking for notifications not yet sent to Telegram...');
+        console.log('🔄 Checking for assignment notifications not yet sent to Telegram...');
         let count = 0;
+        let detailsChanged = false;
 
         for (const [courseId, course] of Object.entries(this.courseData)) {
             for (const [url, record] of Object.entries(course.sentNotifications || {})) {
@@ -2100,7 +2111,7 @@ class VUMonitor {
                 if (sentPlatforms.includes('telegram')) continue;
 
                 let activityName = record.activityName || 'Unknown';
-                let activityType = 'assign';
+                let activityType = '';
                 let section = '';
                 for (const [sectionName, activities] of Object.entries(course.sections || {})) {
                     const found = activities.find(a => a.url === url);
@@ -2112,31 +2123,41 @@ class VUMonitor {
                     }
                 }
 
-                const details = (course.assignments || {})[url];
-                const isQuiz = activityType === 'quiz' || activityType === 'mod_quiz';
-                const deadlineField = isQuiz ? 'closed' : 'deadline';
-                const deadlineText = details?.[deadlineField];
+                const isAssignment = activityType === 'assign' || activityType === 'mod_assign';
+                if (!isAssignment) continue;
 
-                if (deadlineText && deadlineText !== 'نامشخص') {
-                    const info = this.formatPersianDate(deadlineText);
-                    if (info.daysRemaining !== null && info.daysRemaining < 0) continue;
+                if (!this.courseData[courseId].assignments) {
+                    this.courseData[courseId].assignments = {};
                 }
 
-                const emoji = isQuiz ? '❓' : '📝';
-                let message = `${emoji} <b>${activityName}</b>\n`;
+                let details = this.courseData[courseId].assignments[url];
+                if (!details || !details.deadline || details.deadline === 'نامشخص') {
+                    try {
+                        const fetchedDetails = await this.extractAssignmentDetails(url);
+                        if (fetchedDetails && fetchedDetails.success !== false) {
+                            details = fetchedDetails;
+                            this.courseData[courseId].assignments[url] = details;
+                            detailsChanged = true;
+                        }
+                    } catch (error) {
+                        console.error(`Error fetching catch-up assignment details for ${activityName}:`, error.message);
+                    }
+                }
+
+                const deadlineText = details?.deadline;
+                if (!deadlineText || deadlineText === 'نامشخص') continue;
+
+                const dateInfo = this.formatPersianDate(deadlineText);
+                if (dateInfo.daysRemaining === null || dateInfo.daysRemaining < 0) continue;
+
+                let message = `📝 <b>${activityName}</b>\n`;
                 message += `🎓 درس: ${course.name}\n`;
                 if (section) message += `📍 بخش: ${section}\n`;
-
-                if (deadlineText && deadlineText !== 'نامشخص') {
-                    const dateInfo = this.formatPersianDate(deadlineText);
-                    message += `⏰ ${isQuiz ? 'بسته می‌شود' : 'مهلت'}: ${dateInfo.formatted}\n`;
-                    if (dateInfo.daysRemaining !== null && dateInfo.daysRemaining >= 0) {
-                        if (dateInfo.daysRemaining === 0) {
-                            message += `🔴 *امروز*\n`;
-                        } else {
-                            message += `📅 ${dateInfo.daysRemaining} روز باقی مانده\n`;
-                        }
-                    }
+                message += `⏰ مهلت: ${dateInfo.formatted}\n`;
+                if (dateInfo.daysRemaining === 0) {
+                    message += `🔴 *امروز*\n`;
+                } else {
+                    message += `📅 ${dateInfo.daysRemaining} روز باقی مانده\n`;
                 }
 
                 const tgTargets = this.getCourseTargetChatIds(courseId, course.url)
@@ -2144,24 +2165,31 @@ class VUMonitor {
                 if (tgTargets.length === 0) continue;
 
                 try {
-                    await this.sendTelegramMessage(message, {
+                    const sendResult = await this.sendTelegramMessage(message, {
                         chatIds: tgTargets,
                         reply_markup: { inline_keyboard: [[{ text: '🔗 مشاهده', url }]] }
                     });
-                    this.markNotificationSent(courseId, url, ['telegram'], activityName);
-                    await this.saveData();
-                    count++;
-                    await new Promise(r => setTimeout(r, 1000));
+                    if (sendResult.sentPlatforms.includes('telegram')) {
+                        this.markNotificationSent(courseId, url, ['telegram'], activityName);
+                        await this.saveData();
+                        detailsChanged = false;
+                        count++;
+                        await new Promise(r => setTimeout(r, 1000));
+                    }
                 } catch (err) {
                     console.error(`Error sending catch-up notification for ${activityName}:`, err.message);
                 }
             }
         }
 
+        if (detailsChanged) {
+            await this.saveData();
+        }
+
         if (count > 0) {
             console.log(`✅ Sent ${count} catch-up notification(s) to Telegram`);
         } else {
-            console.log('✅ No missing Telegram notifications found');
+            console.log('✅ No missing Telegram assignment notifications found');
         }
     }
     splitCourseOverviewMessage(message) {
@@ -2738,7 +2766,7 @@ class VUMonitor {
                         continue;
                     }
 
-                    await this.sendTelegramMessage(message, {
+                    const sendResult = await this.sendTelegramMessage(message, {
                         chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [
@@ -2758,14 +2786,17 @@ class VUMonitor {
                     }
 
                     this.courseData[courseId].assignments[item.activity.url] = details;
-                    this.markNotificationSent(courseId, item.activity.url, platformsToNotify, item.activity.name);
+                    const sentPlatforms = platformsToNotify.filter(platform => sendResult.sentPlatforms.includes(platform));
+                    if (sentPlatforms.length > 0) {
+                        this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                    }
 
                     await this.saveData();
 
                 } catch (error) {
                     console.error('Error getting assignment details:', error.message);
                     if (!message.includes('مهلت:')) {
-                        await this.sendTelegramMessage(message, {
+                        const fallbackResult = await this.sendTelegramMessage(message, {
                             chatIds: notifyTargets,
                             reply_markup: {
                                 inline_keyboard: [
@@ -2774,6 +2805,11 @@ class VUMonitor {
                                 ]
                             }
                         });
+                        const sentPlatforms = platformsToNotify.filter(platform => fallbackResult.sentPlatforms.includes(platform));
+                        if (sentPlatforms.length > 0) {
+                            this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                            await this.saveData();
+                        }
                     }
                 }
             }
@@ -2845,7 +2881,7 @@ class VUMonitor {
                         }
                     }
 
-                    await this.sendTelegramMessage(message, {
+                    const sendResult = await this.sendTelegramMessage(message, {
                         chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [[
@@ -2854,14 +2890,17 @@ class VUMonitor {
                         }
                     });
 
-                    this.markNotificationSent(courseId, item.activity.url, platformsToNotify, item.activity.name);
+                    const sentPlatforms = platformsToNotify.filter(platform => sendResult.sentPlatforms.includes(platform));
+                    if (sentPlatforms.length > 0) {
+                        this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                    }
                     this.courseData[courseId].assignments[item.activity.url] = details;
 
                     await this.saveData();
 
                 } catch (error) {
                     console.error('Error getting quiz details:', error.message);
-                    await this.sendTelegramMessage(message, {
+                    const fallbackResult = await this.sendTelegramMessage(message, {
                         chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [[
@@ -2870,7 +2909,10 @@ class VUMonitor {
                         }
                     });
 
-                    this.markNotificationSent(courseId, item.activity.url, platformsToNotify, item.activity.name);
+                    const sentPlatforms = platformsToNotify.filter(platform => fallbackResult.sentPlatforms.includes(platform));
+                    if (sentPlatforms.length > 0) {
+                        this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                    }
                     await this.saveData();
                 }
             }
@@ -2886,6 +2928,7 @@ class VUMonitor {
                 message += `🎓 درس: ${courseName}\n`;
                 message += `📍 بخش: ${item.section}\n\n`;
                 message += `📁 ${item.activity.name}\n`;
+                const resourceSentPlatforms = new Set();
 
                 try {
                     console.log(`📥 Extracting file URL for: ${item.activity.name}`);
@@ -2951,21 +2994,26 @@ class VUMonitor {
 
                             for (const target of notifyTargets) {
                                 console.log(`📤 Sending file to ${target.platform} chat ${target.chatId}...`);
-                                await this.sendDocumentViaApi({
-                                    platform: target.platform,
-                                    chatId: target.chatId,
-                                    buffer,
-                                    fileName: fileInfo.fileName,
-                                    caption: formattedCaption,
-                                    contentType
-                                });
+                                try {
+                                    await this.sendDocumentViaApi({
+                                        platform: target.platform,
+                                        chatId: target.chatId,
+                                        buffer,
+                                        fileName: fileInfo.fileName,
+                                        caption: formattedCaption,
+                                        contentType
+                                    });
+                                    resourceSentPlatforms.add(target.platform);
+                                } catch (error) {
+                                    console.error(`❌ Failed to send file to ${target.platform} chat ${target.chatId}:`, error.message);
+                                }
                             }
                             console.log(`✅ File uploaded: ${fileInfo.fileName}`);
                         } else {
                             message += `🔗 ${item.activity.url}\n`;
                             message += `⚠️ حجم فایل: ${fileSizeMB.toFixed(2)} MB (بیش از 100 مگابایت)\n`;
 
-                            await this.sendTelegramMessage(message, {
+                            const sendResult = await this.sendTelegramMessage(message, {
                                 chatIds: notifyTargets,
                                 reply_markup: {
                                     inline_keyboard: [[
@@ -2973,11 +3021,12 @@ class VUMonitor {
                                     ]]
                                 }
                             });
+                            sendResult.sentPlatforms.forEach(platform => resourceSentPlatforms.add(platform));
                         }
                     } else {
                         console.log(`⚠️ Could not extract file URL for: ${item.activity.name}`);
                         message += `🔗 ${item.activity.url}\n`;
-                        await this.sendTelegramMessage(message, {
+                        const sendResult = await this.sendTelegramMessage(message, {
                             chatIds: notifyTargets,
                             reply_markup: {
                                 inline_keyboard: [[
@@ -2985,11 +3034,12 @@ class VUMonitor {
                                 ]]
                             }
                         });
+                        sendResult.sentPlatforms.forEach(platform => resourceSentPlatforms.add(platform));
                     }
                 } catch (error) {
                     console.error(`❌ Error downloading resource file: ${error.message}`);
                     message += `🔗 ${item.activity.url}\n`;
-                    await this.sendTelegramMessage(message, {
+                    const sendResult = await this.sendTelegramMessage(message, {
                         chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [[
@@ -2997,9 +3047,13 @@ class VUMonitor {
                             ]]
                         }
                     });
+                    sendResult.sentPlatforms.forEach(platform => resourceSentPlatforms.add(platform));
                 }
 
-                this.markNotificationSent(courseId, item.activity.url, platformsToNotify, item.activity.name);
+                const sentPlatforms = platformsToNotify.filter(platform => resourceSentPlatforms.has(platform));
+                if (sentPlatforms.length > 0) {
+                    this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                }
                 await this.saveData();
 
                 console.log(`📁 Notified about new file: ${item.activity.name}`);
@@ -3306,17 +3360,32 @@ class VUMonitor {
 
             if (targets.length === 0) {
                 console.log('⚠️ No valid chat ID configured for this message');
-                return;
+                return { ok: false, sentPlatforms: [] };
             }
 
+            const sentPlatforms = [];
+            let failedCount = 0;
             for (const target of targets) {
                 const sendOptions = this.getChatScopedOptions(baseOptions, target);
-                await getBot(target.platform).sendMessage(target.chatId, formattedMessage, sendOptions);
+                try {
+                    await getBot(target.platform).sendMessage(target.chatId, formattedMessage, sendOptions);
+                    sentPlatforms.push(target.platform);
+                } catch (error) {
+                    failedCount++;
+                    console.error(`❌ Failed to send ${target.platform} bot message:`, error.message);
+                }
+            }
+
+            const uniqueSentPlatforms = [...new Set(sentPlatforms)];
+            if (failedCount > 0) {
+                return { ok: false, sentPlatforms: uniqueSentPlatforms };
             }
 
             console.log('✅ Bot notification sent');
+            return { ok: true, sentPlatforms: uniqueSentPlatforms };
         } catch (error) {
             console.error('❌ Failed to send bot message:', error.message);
+            return { ok: false, sentPlatforms: [] };
         }
     }
     async sendCourseOverview(courseId) {
