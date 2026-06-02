@@ -110,6 +110,14 @@ const PREMIUM_EMOJI_MATCHERS = PREMIUM_EMOJI_MAP.map(([emoji, id]) => {
 });
 // base emoji (no variation selector) -> custom emoji id, for button icons.
 const PREMIUM_EMOJI_ID = Object.fromEntries(PREMIUM_EMOJI_MATCHERS.map(m => [m.base, m.id]));
+const BUTTON_STYLE_PRESETS = {
+    primary: { style: 'primary', emoji: '🔗' },
+    success: { style: 'success', emoji: '✅' },
+    danger: { style: 'danger', emoji: '🚨' },
+    calendar: { style: 'primary', emoji: '🗓️' },
+    download: { style: 'success', emoji: '📥' }
+};
+const getPremiumEmojiId = (emoji = '') => PREMIUM_EMOJI_ID[String(emoji).replace(/️/g, '')] || '';
 const getObjectValue = (object, ...keys) => {
     for (const key of keys) {
         if (object[key] !== undefined && object[key] !== null && String(object[key]).trim() !== '') {
@@ -2311,7 +2319,7 @@ class VUMonitor {
                 const deadlineField = isQuiz ? 'closed' : 'deadline';
                 if (details.opened && details.opened !== 'نامشخص') {
                     const openedInfo = this.formatPersianDate(details.opened);
-                    if (openedInfo.daysRemaining !== null && openedInfo.daysRemaining > 0) {
+                    if (this.isTodayOrFutureDate(details.opened, openedInfo)) {
                         addedEvents.add(`${courseId}|${url}|opened`);
                         allDeadlines.push({
                             courseId: String(courseId),
@@ -2358,7 +2366,7 @@ class VUMonitor {
                     if (addedEvents.has(eventKey)) continue;
 
                     const openedInfo = this.formatPersianDate(activity.opened);
-                    if (openedInfo.daysRemaining === null || openedInfo.daysRemaining <= 0) continue;
+                    if (!this.isTodayOrFutureDate(activity.opened, openedInfo)) continue;
 
                     addedEvents.add(eventKey);
                     allDeadlines.push({
@@ -2621,7 +2629,7 @@ class VUMonitor {
                             chatIds: this.getCourseTargetChatIds(courseId),
                             reply_markup: {
                                 inline_keyboard: [
-                                    [{ text: '🔗 مشاهده تمرین', url: item.activity.url, style: 'primary' }],
+                                    [this.styledUrlButton('مشاهده تمرین', item.activity.url, 'primary')],
                                     [googleCalendarButton]
                                 ]
                             }
@@ -2724,7 +2732,7 @@ class VUMonitor {
                             chatIds: this.getCourseTargetChatIds(courseId),
                             reply_markup: {
                                 inline_keyboard: [[
-                                    { text: '🔗 مشاهده آزمون', url: item.activity.url, style: 'primary' }
+                                    this.styledUrlButton('مشاهده آزمون', item.activity.url, 'primary')
                                 ]]
                             }
                         });
@@ -2781,7 +2789,7 @@ class VUMonitor {
                         chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [
-                                [{ text: '🔗 مشاهده تکلیف', url: item.activity.url, style: 'primary' }],
+                                [this.styledUrlButton('مشاهده تکلیف', item.activity.url, 'primary')],
                                 [this.buildGoogleCalendarButton(courseName, item.activity.name, item.activity.url, details.deadline)]
                             ]
                         }
@@ -2812,7 +2820,7 @@ class VUMonitor {
                             chatIds: notifyTargets,
                             reply_markup: {
                                 inline_keyboard: [
-                                    [{ text: '🔗 مشاهده تکلیف', url: item.activity.url, style: 'primary' }],
+                                    [this.styledUrlButton('مشاهده تکلیف', item.activity.url, 'primary')],
                                     [this.buildGoogleCalendarButton(courseName, item.activity.name, item.activity.url)]
                                 ]
                             }
@@ -2898,7 +2906,7 @@ class VUMonitor {
                         chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [[
-                                { text: '🔗 مشاهده آزمون', url: item.activity.url, style: 'primary' }
+                                this.styledUrlButton('مشاهده آزمون', item.activity.url, 'primary')
                             ]]
                         }
                     });
@@ -2918,7 +2926,7 @@ class VUMonitor {
                         chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [[
-                                { text: '🔗 مشاهده آزمون', url: item.activity.url, style: 'primary' }
+                                this.styledUrlButton('مشاهده آزمون', item.activity.url, 'primary')
                             ]]
                         }
                     });
@@ -3032,7 +3040,7 @@ class VUMonitor {
                                 chatIds: notifyTargets,
                                 reply_markup: {
                                     inline_keyboard: [[
-                                        { text: '🔗 دانلود فایل', url: item.activity.url, style: 'success' }
+                                        this.styledUrlButton('دانلود فایل', item.activity.url, 'download')
                                     ]]
                                 }
                             });
@@ -3045,7 +3053,7 @@ class VUMonitor {
                             chatIds: notifyTargets,
                             reply_markup: {
                                 inline_keyboard: [[
-                                    { text: '🔗 دانلود فایل', url: item.activity.url, style: 'success' }
+                                    this.styledUrlButton('دانلود فایل', item.activity.url, 'download')
                                 ]]
                             }
                         });
@@ -3058,7 +3066,7 @@ class VUMonitor {
                         chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [[
-                                { text: '🔗 دانلود فایل', url: item.activity.url, style: 'success' }
+                                this.styledUrlButton('دانلود فایل', item.activity.url, 'download')
                             ]]
                         }
                     });
@@ -3205,6 +3213,19 @@ class VUMonitor {
         const diffTime = targetLocal.getTime() - nowLocal.getTime();
         return Math.round(diffTime / (1000 * 60 * 60 * 24));
     }
+    isTodayOrFutureDate(dateText, dateInfo = null) {
+        const parsedDate = this.parseMoodleDateTime(dateText);
+        if (parsedDate) {
+            const targetLocal = new Date(parsedDate);
+            targetLocal.setHours(0, 0, 0, 0);
+            const nowLocal = new Date();
+            nowLocal.setHours(0, 0, 0, 0);
+            return targetLocal.getTime() >= nowLocal.getTime();
+        }
+
+        const daysRemaining = dateInfo?.daysRemaining;
+        return daysRemaining !== null && daysRemaining !== undefined && daysRemaining >= 0;
+    }
     parsePersianMoodleDateTime(dateText) {
         const text = this.toEnglishDigits(this.cleanText(dateText)).replace(/\s+/g, ' ').trim();
         const match = text.match(/(\d{1,2})\s+([\u0600-\u06FF]+)\s+(\d{4})(?:\s*(?:[،,]|-)?\s*(?:ساعت)?\s*(\d{1,2}):(\d{2}))?/);
@@ -3276,6 +3297,37 @@ class VUMonitor {
         const ss = String(date.getUTCSeconds()).padStart(2, '0');
         return `${yyyy}${mm}${dd}T${hh}${min}${ss}Z`;
     }
+    getButtonStylePreset(style = 'primary') {
+        const preset = BUTTON_STYLE_PRESETS[style] || BUTTON_STYLE_PRESETS.primary;
+        return {
+            ...preset,
+            icon_custom_emoji_id: getPremiumEmojiId(preset.emoji)
+        };
+    }
+    withButtonEmoji(label, buttonStyle) {
+        const text = this.cleanText(label);
+        const emoji = buttonStyle?.emoji || '';
+        const baseEmoji = emoji.replace(/️/g, '');
+        if (!emoji || text.startsWith(emoji) || text.startsWith(baseEmoji)) {
+            return text;
+        }
+        return `${emoji} ${text}`;
+    }
+    styledButton(label, fields = {}, style = 'primary') {
+        const buttonStyle = this.getButtonStylePreset(style);
+        const button = {
+            text: this.withButtonEmoji(label, buttonStyle),
+            ...fields,
+            style: buttonStyle.style
+        };
+        if (buttonStyle.icon_custom_emoji_id) {
+            button.icon_custom_emoji_id = buttonStyle.icon_custom_emoji_id;
+        }
+        return button;
+    }
+    styledUrlButton(label, url, style = 'primary') {
+        return this.styledButton(label, { url }, style);
+    }
     buildGoogleCalendarButton(courseName, activityName, activityUrl, dueText = 'نامشخص') {
         const title = `تمرین: ${activityName}`;
         const detailsParts = [
@@ -3296,10 +3348,7 @@ class VUMonitor {
             params.set('dates', `${this.formatGoogleCalendarDate(start)}/${this.formatGoogleCalendarDate(dueDate)}`);
         }
 
-        return {
-            text: '🗓️ اضافه کردن در تقویم گوگل',
-            url: `https://calendar.google.com/calendar/render?${params.toString()}`
-        };
+        return this.styledUrlButton('اضافه کردن در تقویم گوگل', `https://calendar.google.com/calendar/render?${params.toString()}`, 'calendar');
     }
     buildDaysRemainingLine(daysRemaining) {
         if (daysRemaining === null || daysRemaining === undefined) return '';
@@ -3540,7 +3589,7 @@ class VUMonitor {
         if (!replyMarkup || !Array.isArray(replyMarkup.inline_keyboard)) {
             return replyMarkup;
         }
-        const leadingEmojiRe = /^\s*(\p{Extended_Pictographic}️?)\s+/u;
+        const leadingEmojiRe = /^\s*(\p{Extended_Pictographic}️?|\p{Emoji_Presentation}️?|[\u2600-\u27BF]️?)\s+/u;
         const mapButton = (button) => {
             const { style, icon_custom_emoji_id, ...rest } = button;
             if (platform !== 'telegram') {
@@ -3551,10 +3600,12 @@ class VUMonitor {
             if (USE_PREMIUM_EMOJI && typeof out.text === 'string') {
                 const match = out.text.match(leadingEmojiRe);
                 const base = match ? match[1].replace(/️/g, '') : '';
-                const emojiId = base && PREMIUM_EMOJI_ID[base];
+                const emojiId = (base && PREMIUM_EMOJI_ID[base]) || icon_custom_emoji_id;
                 if (emojiId) {
                     out.icon_custom_emoji_id = emojiId;
-                    out.text = out.text.slice(match[0].length);
+                    if (match) {
+                        out.text = out.text.slice(match[0].length);
+                    }
                 }
             } else if (icon_custom_emoji_id) {
                 out.icon_custom_emoji_id = icon_custom_emoji_id;
@@ -3780,7 +3831,7 @@ class VUMonitor {
                             chatIds: targetChatIds,
                             reply_markup: {
                                 inline_keyboard: [[
-                                    { text: `🔗 مشاهده ${isQuiz ? 'آزمون' : 'تکلیف'}`, url: activity.url, style: 'danger' }
+                                    this.styledUrlButton(`مشاهده ${isQuiz ? 'آزمون' : 'تکلیف'}`, activity.url, 'danger')
                                 ]]
                             }
                         });
