@@ -3726,9 +3726,27 @@ class VUMonitor {
                     const isQuiz = activity.type === 'quiz' || activity.type === 'mod_quiz';
                     const lastDayReminderKey = `${courseId}_${activity.url}_lastday`;
 
-                    if (this.sentLastDayReminders[lastDayReminderKey]) {
+                    // Determine which platforms this reminder must reach and which
+                    // (if any) already received it successfully on a previous cycle.
+                    const targetChatIds = this.getCourseTargetChatIds(courseId, course.url);
+                    const targetPlatforms = [...new Set(targetChatIds.map(target => target.platform))];
+
+                    const existingReminder = this.sentLastDayReminders[lastDayReminderKey];
+                    // Backward compatibility: legacy records have no sentPlatforms field,
+                    // so treat them as fully delivered to avoid re-spamming on upgrade.
+                    const alreadySentPlatforms = existingReminder
+                        ? (Array.isArray(existingReminder.sentPlatforms)
+                            ? existingReminder.sentPlatforms
+                            : targetPlatforms)
+                        : [];
+                    const pendingPlatforms = targetPlatforms.filter(platform => !alreadySentPlatforms.includes(platform));
+
+                    if (existingReminder && pendingPlatforms.length === 0) {
                         console.log(`📅 Last day reminder already sent for: ${activity.name}`);
                         continue;
+                    }
+                    if (existingReminder) {
+                        console.log(`🔁 Retrying last day reminder for: ${activity.name} on platforms: ${pendingPlatforms.join(', ')}`);
                     }
 
                     try {
@@ -3827,11 +3845,13 @@ class VUMonitor {
                             message += `🔴 <b>فقط ${hoursRemaining} ساعت و ${minutesRemaining} دقیقه دیگر!</b>`;
                         }
 
-                        const targetChatIds = this.getCourseTargetChatIds(courseId, course.url);
-                        console.log(`📤 Sending reminder for "${activity.name}" to chats: ${targetChatIds.map(target => `${target.platform}:${target.chatId}`).join(', ')}`);
+                        // Only send to platforms that have not yet received this reminder,
+                        // so a successful platform is never spammed on a retry.
+                        const sendTargets = targetChatIds.filter(target => pendingPlatforms.includes(target.platform));
+                        console.log(`📤 Sending reminder for "${activity.name}" to chats: ${sendTargets.map(target => `${target.platform}:${target.chatId}`).join(', ')}`);
 
-                        await this.sendTelegramMessage(message, {
-                            chatIds: targetChatIds,
+                        const sendResult = await this.sendTelegramMessage(message, {
+                            chatIds: sendTargets,
                             reply_markup: {
                                 inline_keyboard: [[
                                     this.styledUrlButton(`مشاهده ${isQuiz ? 'آزمون' : 'تکلیف'}`, activity.url, 'danger')
@@ -3839,11 +3859,19 @@ class VUMonitor {
                             }
                         });
 
+                        // Merge platforms that succeeded this cycle with any from before.
+                        const newlySentPlatforms = Array.isArray(sendResult?.sentPlatforms) ? sendResult.sentPlatforms : [];
+                        const sentPlatforms = [...new Set([...alreadySentPlatforms, ...newlySentPlatforms])];
+                        const failedPlatforms = targetPlatforms.filter(platform => !sentPlatforms.includes(platform));
+
                         const reminderRecord = {
                             sentAt: nowLocal.toISOString(),
                             deadline: deadlineLocal.toISOString(),
                             courseName: course.name,
-                            activityName: activity.name
+                            activityName: activity.name,
+                            sentPlatforms,
+                            // Empty when fully delivered; otherwise the platforms to retry next cycle.
+                            pendingPlatforms: failedPlatforms
                         };
 
                         this.sentLastDayReminders[lastDayReminderKey] = reminderRecord;
@@ -3852,7 +3880,11 @@ class VUMonitor {
 
                         await this.saveData();
 
-                        console.log(`⏰ Sent last-day reminder for: ${activity.name}`);
+                        if (failedPlatforms.length > 0) {
+                            console.log(`⚠️ Last-day reminder for "${activity.name}" failed on: ${failedPlatforms.join(', ')} — will retry next cycle`);
+                        } else {
+                            console.log(`⏰ Sent last-day reminder for: ${activity.name}`);
+                        }
                         await new Promise(r => setTimeout(r, 2000));
 
                     } catch (error) {
