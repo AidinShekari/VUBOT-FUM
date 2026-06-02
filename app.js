@@ -46,6 +46,67 @@ const parseBoolean = (value, defaultValue = false) => {
     }
     return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 };
+// ─── Telegram premium (custom) emoji ─────────────────────────────────────────
+// Premium emoji only render on Telegram (HTML parse mode, via <tg-emoji>) and
+// only for bots that own a Fragment username. Bale keeps the plain emoji.
+const USE_PREMIUM_EMOJI = parseBoolean(process.env.USE_PREMIUM_EMOJI, true);
+const PREMIUM_EMOJI_MAP = [
+    ['⭐️', '4956591756519932897'],
+    ['🗓', '4956214413578207998'],
+    ['📊', '5431577498364158238'],
+    ['📈', '5373001317042101552'],
+    ['📉', '5361748661640372834'],
+    ['📥', '5433811242135331842'],
+    ['📤', '5433614747381538714'],
+    ['📪', '5350310124349053625'],
+    ['📬', '5350421256627838238'],
+    ['📭', '5352896944496728039'],
+    ['📂', '5431721976769027887'],
+    ['📁', '5433653135799228968'],
+    ['✔️', '6037088297061191007'],
+    ['⚠️', '6037255895275015803'],
+    ['🚫', '6039591820613127611'],
+    ['‼️', '6039866092929683270'],
+    ['🟢', '6039690609155903995'],
+    ['🔴', '6039708450450050609'],
+    ['💲', '6037191595319627499'],
+    ['🗣️', '6037212589119770375'],
+    ['📣', '6037631219582110913'],
+    ['⚡️', '6037220740967697584'],
+    ['❓', '6037630738545774536'],
+    ['💬', '6039520378127126241'],
+    ['🔔', '6039712977345580805'],
+    ['🔼', '6037522410880634278'],
+    ['🔽', '6037507275415883903'],
+    ['🕯', '6037265047850324263'],
+    ['📌', '6037579284837567462'],
+    ['✅', '5123163417326126159'],
+    ['🔗', '4958689671950369798'],
+    ['❌', '4958526153955476488'],
+    ['📚', '5373098009640836781'],
+    ['🎓', '5375163339154399459'],
+    ['📎', '5305265301917549162'],
+    ['📝', '5230982773086365287'],
+    ['🕐', '5386367538735104399'],
+    ['🆕', '4956287101604725699'],
+    ['🟡', '5852626860516577393'],
+    ['🔓', '5296369303661067030'],
+    ['🚨', '5395695537687123235'],
+    ['🔄', '4956371914323920049'],
+    ['📅', '5413879192267805083'],
+    ['ℹ️', '4958529074533238201']
+];
+const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// Match each emoji even if it appears with/without a trailing variation selector (FE0F).
+const PREMIUM_EMOJI_MATCHERS = PREMIUM_EMOJI_MAP.map(([emoji, id]) => {
+    const base = emoji.replace(/️/g, '');
+    return {
+        id,
+        display: emoji,
+        base,
+        regex: new RegExp(escapeRegExp(base) + '\\uFE0F?', 'g')
+    };
+});
 const getObjectValue = (object, ...keys) => {
     for (const key of keys) {
         if (object[key] !== undefined && object[key] !== null && String(object[key]).trim() !== '') {
@@ -1829,7 +1890,7 @@ class VUMonitor {
             statusCode: response.statusCode
         };
     }
-    async sendDocumentViaApi({ chatId, platform = DEFAULT_PLATFORM, buffer, fileName, caption, contentType }) {
+    async sendDocumentViaApi({ chatId, platform = DEFAULT_PLATFORM, buffer, fileName, caption, contentType, parseMode = 'Markdown' }) {
         const target = this.normalizeChatTarget({ platform, chatId });
         if (!target) {
             throw new Error('No valid chat ID provided for sendDocument');
@@ -1845,7 +1906,7 @@ class VUMonitor {
         const fields = [
             { name: 'chat_id', value: String(target.chatId) },
             { name: 'caption', value: caption || '' },
-            { name: 'parse_mode', value: 'Markdown' }
+            { name: 'parse_mode', value: parseMode }
         ];
 
         if (platformConfig.topicId && String(target.chatId) === String(platformConfig.globalChatId)) {
@@ -1962,7 +2023,7 @@ class VUMonitor {
         
         let sectionsMsg = '';
         for (const [sectionName, activities] of Object.entries(allSections)) {
-            let sectionMsg = `📍 <b>${sectionName}</b>\n`;
+            let sectionMsg = `📂 <b>${sectionName}</b>\n`;
             let hasActivities = false;
             for (const activity of activities) {
                 const isDeadlineBased = ['assign', 'mod_assign', 'quiz', 'mod_quiz'].includes(activity.type);
@@ -1986,10 +2047,7 @@ class VUMonitor {
         message += `━━━━━━━━━━━━━━━━━\n`;
         message += `🕐 ${this.getLocalTimestamp()}`;
 
-        const formattedMessage = this.toMarkdown(message);
-        const messageParts = this.splitCourseOverviewMessage(formattedMessage);
         const baseOptions = {
-            parse_mode: 'Markdown',
             disable_web_page_preview: true
         };
 
@@ -2012,7 +2070,12 @@ class VUMonitor {
             const platformBot = getBot(target.platform);
             const existingIds = this.getStoredCourseMessageIds(courseId, target);
             const finalIds = [];
-            const scopedOptions = this.getChatScopedOptions(baseOptions, target);
+            const formatted = this.formatForPlatform(message, target.platform);
+            const messageParts = this.splitCourseOverviewMessage(formatted.text);
+            const scopedOptions = this.getChatScopedOptions(
+                { ...baseOptions, parse_mode: formatted.parse_mode },
+                target
+            );
 
             try {
                 for (let i = 0; i < messageParts.length; i++) {
@@ -2217,7 +2280,7 @@ class VUMonitor {
         }
 
         message += `🕐 آخرین به‌روزرسانی: ${this.getLocalTimestamp()}`;
-        return this.toMarkdown(message);
+        return message;
     }
     async sendOrUpdateDeadlineOverview() {
         console.log('⏰ Updating deadline overview message...');
@@ -2323,7 +2386,6 @@ class VUMonitor {
         }
 
         const baseOptions = {
-            parse_mode: 'Markdown',
             disable_web_page_preview: true
         };
         const nextDeadlineMessageIds = {};
@@ -2334,7 +2396,10 @@ class VUMonitor {
             const platformBot = getBot(target.platform);
             const platformConfig = this.getPlatformConfig(target.platform);
             const existingMessageId = this.normalizeMessageId(this.deadlineMessageIds[key]);
-            const scopedOptions = this.getChatScopedOptions(baseOptions, target);
+            const scopedOptions = this.getChatScopedOptions(
+                { ...baseOptions, parse_mode: target.platform === 'telegram' ? 'HTML' : 'Markdown' },
+                target
+            );
             const isGlobalChat = platformConfig?.globalChatId
                 && String(chatId) === String(platformConfig.globalChatId);
             let keepExistingIdOnFailure = existingMessageId !== null;
@@ -2346,7 +2411,10 @@ class VUMonitor {
                     ? allDeadlines.filter(item => allowedCourseIds.has(String(item.courseId)))
                     : [];
             }
-            const formattedMessage = this.buildDeadlineOverviewMessage(chatDeadlines);
+            const formattedMessage = this.formatForPlatform(
+                this.buildDeadlineOverviewMessage(chatDeadlines),
+                target.platform
+            ).text;
             const recentMatchedIds = await this.findRecentDeadlineOverviewMessageIds(target, 100);
             const allCandidateIds = [
                 ...this.getStoredDeadlineMessageCandidates(target),
@@ -2765,7 +2833,7 @@ class VUMonitor {
 
                 let message = `🆕 <b>آزمون جدید</b>\n\n`;
                 message += `🎓 درس: ${courseName}\n`;
-                message += `📍 بخش: ${item.section}\n\n`;
+                message += `📂 بخش: ${item.section}\n\n`;
                 message += `❓ ${item.activity.name}\n\n`;
 
                 try {
@@ -2870,7 +2938,7 @@ class VUMonitor {
 
                 let message = `🆕 <b>فایل جدید</b>\n\n`;
                 message += `🎓 درس: ${courseName}\n`;
-                message += `📍 بخش: ${item.section}\n\n`;
+                message += `📂 بخش: ${item.section}\n\n`;
                 message += `📁 ${item.activity.name}\n`;
                 const resourceSentPlatforms = new Set();
 
@@ -2931,20 +2999,20 @@ class VUMonitor {
                         if (fileSizeMB <= 100) {
                             let caption = `🆕 <b>فایل جدید</b>\n\n`;
                             caption += `🎓 درس: ${courseName}\n`;
-                            caption += `📍 بخش: ${item.section}\n\n`;
+                            caption += `📂 بخش: ${item.section}\n\n`;
                             caption += `📎 ${fileInfo.fileName}`;
-
-                            const formattedCaption = this.toMarkdown(caption);
 
                             for (const target of notifyTargets) {
                                 console.log(`📤 Sending file to ${target.platform} chat ${target.chatId}...`);
+                                const formattedCaption = this.formatForPlatform(caption, target.platform);
                                 try {
                                     await this.sendDocumentViaApi({
                                         platform: target.platform,
                                         chatId: target.chatId,
                                         buffer,
                                         fileName: fileInfo.fileName,
-                                        caption: formattedCaption,
+                                        caption: formattedCaption.text,
+                                        parseMode: formattedCaption.parse_mode,
                                         contentType
                                     });
                                     resourceSentPlatforms.add(target.platform);
@@ -3008,7 +3076,7 @@ class VUMonitor {
         const emoji = this.getEmoji(item.activity.type);
         
         let message = `🎓 درس: ${course.name}\n\n`;
-        message += `📍 بخش: ${item.section}\n\n`;
+        message += `📂 بخش: ${item.section}\n\n`;
         message += `${emoji} ${item.activity.name}\n\n`;
         message += `🔗 لینک: ${item.activity.url}`;
         
@@ -3241,7 +3309,7 @@ class VUMonitor {
     buildNewAssignmentMessage(courseName, sectionName, activityName, details = {}) {
         let message = `🆕 تکلیف جدید\n\n`;
         message += `🎓 درس: ${courseName}\n`;
-        message += `📍 بخش: ${sectionName}\n\n`;
+        message += `📂 بخش: ${sectionName}\n\n`;
         message += `📝 ${activityName}\n\n`;
 
         if (details.opened && details.opened !== 'نامشخص') {
@@ -3402,6 +3470,65 @@ class VUMonitor {
             .replace(/<br\s*\/?>/gi, '\n')
             .replace(/<[^>]*>/g, '');
     }
+    escapeHtml(value = '') {
+        return String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+    }
+    // Convert the internal HTML-ish message into valid Telegram HTML, escaping
+    // any stray special characters in the dynamic content while preserving the
+    // intentional <b>/<a>/<i> tags.
+    toHtml(message) {
+        if (!message) return '';
+        const tokenRe = /<a\s+href="[^"]*">|<\/a>|<\/?b>|<\/?strong>|<\/?i>|<br\s*\/?>/gi;
+        let result = '';
+        let lastIndex = 0;
+        let match;
+        while ((match = tokenRe.exec(message)) !== null) {
+            result += this.escapeHtml(message.slice(lastIndex, match.index));
+            const tag = match[0];
+            const lower = tag.toLowerCase();
+            if (lower.startsWith('<br')) {
+                result += '\n';
+            } else if (lower.startsWith('<a')) {
+                const href = tag.match(/href="([^"]*)"/i);
+                result += `<a href="${this.escapeHtml(href ? href[1] : '')}">`;
+            } else if (lower === '<strong>') {
+                result += '<b>';
+            } else if (lower === '</strong>') {
+                result += '</b>';
+            } else {
+                result += lower;
+            }
+            lastIndex = tokenRe.lastIndex;
+        }
+        result += this.escapeHtml(message.slice(lastIndex));
+        return result;
+    }
+    // Wrap known emoji in <tg-emoji> so Telegram renders them as premium emoji.
+    applyPremiumEmoji(text) {
+        if (!text || !USE_PREMIUM_EMOJI) return text;
+        let result = text;
+        for (const matcher of PREMIUM_EMOJI_MATCHERS) {
+            if (result.indexOf(matcher.base) === -1) continue;
+            matcher.regex.lastIndex = 0;
+            result = result.replace(
+                matcher.regex,
+                `<tg-emoji emoji-id="${matcher.id}">${matcher.display}</tg-emoji>`
+            );
+        }
+        return result;
+    }
+    // Format an internal message for a specific platform:
+    //  - Telegram → HTML with premium <tg-emoji> entities
+    //  - Bale (and others) → Markdown with plain emoji (unchanged behaviour)
+    formatForPlatform(message, platform) {
+        if (platform === 'telegram') {
+            return { text: this.applyPremiumEmoji(this.toHtml(message)), parse_mode: 'HTML' };
+        }
+        return { text: this.toMarkdown(message), parse_mode: 'Markdown' };
+    }
     // Returns local system time as a Jalali (Shamsi) timestamp — Windows-friendly
     getLocalTimestamp() {
         return moment().format('jYYYY/jMM/jDD HH:mm');
@@ -3409,9 +3536,7 @@ class VUMonitor {
     async sendTelegramMessage(message, options = {}) {
         try {
             const { chatIds, ...rawOptions } = options;
-            const formattedMessage = this.toMarkdown(message);
             const baseOptions = {
-                parse_mode: 'Markdown',
                 disable_web_page_preview: true,
                 ...rawOptions
             };
@@ -3437,9 +3562,13 @@ class VUMonitor {
             const sentMessages = [];
             let failedCount = 0;
             for (const target of targets) {
-                const sendOptions = this.getChatScopedOptions(baseOptions, target);
+                const formatted = this.formatForPlatform(message, target.platform);
+                const sendOptions = this.getChatScopedOptions(
+                    { ...baseOptions, parse_mode: baseOptions.parse_mode || formatted.parse_mode },
+                    target
+                );
                 try {
-                    const sentMessage = await getBot(target.platform).sendMessage(target.chatId, formattedMessage, sendOptions);
+                    const sentMessage = await getBot(target.platform).sendMessage(target.chatId, formatted.text, sendOptions);
                     sentPlatforms.push(target.platform);
                     const messageId = this.normalizeMessageId(sentMessage?.message_id);
                     if (messageId !== null) {
@@ -3591,7 +3720,7 @@ class VUMonitor {
                         const dateInfo = this.formatPersianDate(deadlineText);
                         let message = `⏰ *یادآوری: مهلت ${isQuiz ? 'آزمون' : 'تکلیف'} رو به پایان است!*\n\n`;
                         message += `🎓 درس: ${course.name}\n`;
-                        message += `📍 بخش: ${sectionName}\n\n`;
+                        message += `📂 بخش: ${sectionName}\n\n`;
                         message += `${isQuiz ? '❓' : '📝'} ${activity.name}\n\n`;
                         message += `⏰ ${isQuiz ? 'بسته می‌شود' : 'مهلت'}: ${dateInfo.formatted}\n`;
 
@@ -3713,10 +3842,14 @@ class VUMonitor {
                     if (!platformConfig?.token || !platformConfig.adminChatId) {
                         continue;
                     }
+                    const formattedError = this.formatForPlatform(
+                        `🚨 <b>خرابی در چرخه بررسی دوره‌ها</b>\n\n${error.message}`,
+                        platform
+                    );
                     await getBot(platform).sendMessage(
                         platformConfig.adminChatId,
-                        this.toMarkdown(`🚨 <b>خرابی در چرخه بررسی دوره‌ها</b>\n\n${error.message}`),
-                        { parse_mode: 'Markdown' }
+                        formattedError.text,
+                        { parse_mode: formattedError.parse_mode }
                     );
                 }
             } catch (telegramError) {
