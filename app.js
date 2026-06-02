@@ -2076,6 +2076,8 @@ class VUMonitor {
             return;
         }
 
+        let maxMessageParts = 0;
+
         for (const target of globalTargets) {
             const chatId = target.chatId;
             const platformBot = getBot(target.platform);
@@ -2083,6 +2085,7 @@ class VUMonitor {
             const finalIds = [];
             const formatted = this.formatForPlatform(message, target.platform);
             const messageParts = this.splitCourseOverviewMessage(formatted.text);
+            maxMessageParts = Math.max(maxMessageParts, messageParts.length);
             const scopedOptions = this.getChatScopedOptions(
                 { ...baseOptions, parse_mode: formatted.parse_mode },
                 target
@@ -2137,7 +2140,7 @@ class VUMonitor {
             }
         }
 
-        console.log(`✏️ Updated overview message for course ${courseId} in ${messageParts.length} part(s)`);
+        console.log(`✏️ Updated overview message for course ${courseId} in ${maxMessageParts} part(s)`);
     }
     // ─── Startup cleanup: delete any overview messages sent to non-global chats
     // and any previously sent per-course overview messages stored in message_ids.json
@@ -3889,7 +3892,8 @@ class VUMonitor {
                     try {
                         await this.runWithTimeout(this.checkCourse(courseUrl), 120000, `Course check timed out for ${courseUrl}`);
                     } catch (timeoutErr) {
-                        console.error(`⏱️ Timeout while checking course ${courseUrl}:`, timeoutErr.message);
+                        const isTimeout = timeoutErr.message === `Course check timed out for ${courseUrl}`;
+                        console.error(`${isTimeout ? '⏱️ Timeout' : '❌ Error'} while checking course ${courseUrl}:`, timeoutErr.message);
                         continue;
                     }
                     await new Promise(resolve => setTimeout(resolve, 3000));
