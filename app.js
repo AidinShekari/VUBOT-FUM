@@ -94,7 +94,8 @@ const PREMIUM_EMOJI_MAP = [
     ['🚨', '5395695537687123235'],
     ['🔄', '4956371914323920049'],
     ['📅', '5413879192267805083'],
-    ['ℹ️', '4958529074533238201']
+    ['ℹ️', '4958529074533238201'],
+    ['⏰', '5413704112220949842']
 ];
 const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // Match each emoji even if it appears with/without a trailing variation selector (FE0F).
@@ -107,6 +108,8 @@ const PREMIUM_EMOJI_MATCHERS = PREMIUM_EMOJI_MAP.map(([emoji, id]) => {
         regex: new RegExp(escapeRegExp(base) + '\\uFE0F?', 'g')
     };
 });
+// base emoji (no variation selector) -> custom emoji id, for button icons.
+const PREMIUM_EMOJI_ID = Object.fromEntries(PREMIUM_EMOJI_MATCHERS.map(m => [m.base, m.id]));
 const getObjectValue = (object, ...keys) => {
     for (const key of keys) {
         if (object[key] !== undefined && object[key] !== null && String(object[key]).trim() !== '') {
@@ -1573,11 +1576,11 @@ class VUMonitor {
 
             for (const div of this.queryAll(document, '[data-region="activity-dates"] .description-inner > div')) {
                 const text = this.nodeText(div);
-                let match = text.match(/(?:باز شده:|Opened:)\s*(.+)/);
+                let match = text.match(/(?:باز\s*(?:شده|شد|می[‌\s]*شود)|Opens?|Opened)\s*:\s*(.+)/);
                 if (match) {
                     opened = match[1].trim();
                 }
-                match = text.match(/(?:بسته شده:|Closed:)\s*(.+)/);
+                match = text.match(/(?:بسته\s*(?:شده|شد|می[‌\s]*شود)|Closes?|Closed)\s*:\s*(.+)/);
                 if (match) {
                     closed = match[1].trim();
                 }
@@ -1704,11 +1707,11 @@ class VUMonitor {
 
             for (const div of this.queryAll(document, '[data-region="activity-dates"] .description-inner > div')) {
                 const text = this.nodeText(div);
-                let match = text.match(/(?:باز شده:|Opened:)\s*(.+)/);
+                let match = text.match(/(?:باز\s*(?:شده|شد|می[‌\s]*شود)|Opens?|Opened)\s*:\s*(.+)/);
                 if (match) {
                     opened = match[1].trim();
                 }
-                match = text.match(/(?:مهلت:|Due:)\s*(.+)/);
+                match = text.match(/(?:مهلت(?:\s*تحویل)?:|Due:)\s*(.+)/);
                 if (match) {
                     deadline = match[1].trim();
                 }
@@ -2618,7 +2621,7 @@ class VUMonitor {
                             chatIds: this.getCourseTargetChatIds(courseId),
                             reply_markup: {
                                 inline_keyboard: [
-                                    [{ text: '🔗 مشاهده تمرین', url: item.activity.url }],
+                                    [{ text: '🔗 مشاهده تمرین', url: item.activity.url, style: 'primary' }],
                                     [googleCalendarButton]
                                 ]
                             }
@@ -2721,7 +2724,7 @@ class VUMonitor {
                             chatIds: this.getCourseTargetChatIds(courseId),
                             reply_markup: {
                                 inline_keyboard: [[
-                                    { text: '🔗 مشاهده آزمون', url: item.activity.url }
+                                    { text: '🔗 مشاهده آزمون', url: item.activity.url, style: 'primary' }
                                 ]]
                             }
                         });
@@ -2778,7 +2781,7 @@ class VUMonitor {
                         chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [
-                                [{ text: '🔗 مشاهده تکلیف', url: item.activity.url }],
+                                [{ text: '🔗 مشاهده تکلیف', url: item.activity.url, style: 'primary' }],
                                 [this.buildGoogleCalendarButton(courseName, item.activity.name, item.activity.url, details.deadline)]
                             ]
                         }
@@ -2809,7 +2812,7 @@ class VUMonitor {
                             chatIds: notifyTargets,
                             reply_markup: {
                                 inline_keyboard: [
-                                    [{ text: '🔗 مشاهده تکلیف', url: item.activity.url }],
+                                    [{ text: '🔗 مشاهده تکلیف', url: item.activity.url, style: 'primary' }],
                                     [this.buildGoogleCalendarButton(courseName, item.activity.name, item.activity.url)]
                                 ]
                             }
@@ -2895,7 +2898,7 @@ class VUMonitor {
                         chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [[
-                                { text: '🔗 مشاهده آزمون', url: item.activity.url }
+                                { text: '🔗 مشاهده آزمون', url: item.activity.url, style: 'primary' }
                             ]]
                         }
                     });
@@ -2915,7 +2918,7 @@ class VUMonitor {
                         chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [[
-                                { text: '🔗 مشاهده آزمون', url: item.activity.url }
+                                { text: '🔗 مشاهده آزمون', url: item.activity.url, style: 'primary' }
                             ]]
                         }
                     });
@@ -3029,7 +3032,7 @@ class VUMonitor {
                                 chatIds: notifyTargets,
                                 reply_markup: {
                                     inline_keyboard: [[
-                                        { text: '🔗 دانلود فایل', url: item.activity.url }
+                                        { text: '🔗 دانلود فایل', url: item.activity.url, style: 'success' }
                                     ]]
                                 }
                             });
@@ -3042,7 +3045,7 @@ class VUMonitor {
                             chatIds: notifyTargets,
                             reply_markup: {
                                 inline_keyboard: [[
-                                    { text: '🔗 دانلود فایل', url: item.activity.url }
+                                    { text: '🔗 دانلود فایل', url: item.activity.url, style: 'success' }
                                 ]]
                             }
                         });
@@ -3055,7 +3058,7 @@ class VUMonitor {
                         chatIds: notifyTargets,
                         reply_markup: {
                             inline_keyboard: [[
-                                { text: '🔗 دانلود فایل', url: item.activity.url }
+                                { text: '🔗 دانلود فایل', url: item.activity.url, style: 'success' }
                             ]]
                         }
                     });
@@ -3529,6 +3532,40 @@ class VUMonitor {
         }
         return { text: this.toMarkdown(message), parse_mode: 'Markdown' };
     }
+    // Adapt an inline keyboard for a platform. On Telegram (Bot API 9.4+) keep the
+    // `style` (primary/success/danger) and turn a button's leading emoji into a
+    // premium `icon_custom_emoji_id`. On Bale, drop those unsupported fields and
+    // keep the plain leading emoji in the text.
+    sanitizeReplyMarkupForPlatform(replyMarkup, platform) {
+        if (!replyMarkup || !Array.isArray(replyMarkup.inline_keyboard)) {
+            return replyMarkup;
+        }
+        const leadingEmojiRe = /^\s*(\p{Extended_Pictographic}️?)\s+/u;
+        const mapButton = (button) => {
+            const { style, icon_custom_emoji_id, ...rest } = button;
+            if (platform !== 'telegram') {
+                return rest; // Bale: plain button, no style/icon fields
+            }
+            const out = { ...rest };
+            if (style) out.style = style;
+            if (USE_PREMIUM_EMOJI && typeof out.text === 'string') {
+                const match = out.text.match(leadingEmojiRe);
+                const base = match ? match[1].replace(/️/g, '') : '';
+                const emojiId = base && PREMIUM_EMOJI_ID[base];
+                if (emojiId) {
+                    out.icon_custom_emoji_id = emojiId;
+                    out.text = out.text.slice(match[0].length);
+                }
+            } else if (icon_custom_emoji_id) {
+                out.icon_custom_emoji_id = icon_custom_emoji_id;
+            }
+            return out;
+        };
+        return {
+            ...replyMarkup,
+            inline_keyboard: replyMarkup.inline_keyboard.map(row => row.map(mapButton))
+        };
+    }
     // Returns local system time as a Jalali (Shamsi) timestamp — Windows-friendly
     getLocalTimestamp() {
         return moment().format('jYYYY/jMM/jDD HH:mm');
@@ -3567,6 +3604,9 @@ class VUMonitor {
                     { ...baseOptions, parse_mode: baseOptions.parse_mode || formatted.parse_mode },
                     target
                 );
+                if (sendOptions.reply_markup) {
+                    sendOptions.reply_markup = this.sanitizeReplyMarkupForPlatform(sendOptions.reply_markup, target.platform);
+                }
                 try {
                     const sentMessage = await getBot(target.platform).sendMessage(target.chatId, formatted.text, sendOptions);
                     sentPlatforms.push(target.platform);
@@ -3718,7 +3758,7 @@ class VUMonitor {
                         }
 
                         const dateInfo = this.formatPersianDate(deadlineText);
-                        let message = `⏰ *یادآوری: مهلت ${isQuiz ? 'آزمون' : 'تکلیف'} رو به پایان است!*\n\n`;
+                        let message = `⏰ <b>یادآوری: مهلت ${isQuiz ? 'آزمون' : 'تکلیف'} رو به پایان است!</b>\n\n`;
                         message += `🎓 درس: ${course.name}\n`;
                         message += `📂 بخش: ${sectionName}\n\n`;
                         message += `${isQuiz ? '❓' : '📝'} ${activity.name}\n\n`;
@@ -3728,9 +3768,9 @@ class VUMonitor {
                         const minutesRemaining = Math.floor((hoursUntilDeadline - hoursRemaining) * 60);
 
                         if (hoursRemaining === 0) {
-                            message += `🔴 *فقط ${minutesRemaining} دقیقه دیگر!*`;
+                            message += `🔴 <b>فقط ${minutesRemaining} دقیقه دیگر!</b>`;
                         } else {
-                            message += `🔴 *فقط ${hoursRemaining} ساعت و ${minutesRemaining} دقیقه دیگر!*`;
+                            message += `🔴 <b>فقط ${hoursRemaining} ساعت و ${minutesRemaining} دقیقه دیگر!</b>`;
                         }
 
                         const targetChatIds = this.getCourseTargetChatIds(courseId, course.url);
@@ -3740,7 +3780,7 @@ class VUMonitor {
                             chatIds: targetChatIds,
                             reply_markup: {
                                 inline_keyboard: [[
-                                    { text: `🔗 مشاهده ${isQuiz ? 'آزمون' : 'تکلیف'}`, url: activity.url }
+                                    { text: `🔗 مشاهده ${isQuiz ? 'آزمون' : 'تکلیف'}`, url: activity.url, style: 'danger' }
                                 ]]
                             }
                         });
