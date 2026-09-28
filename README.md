@@ -103,8 +103,10 @@ The recommended format is JSON:
 COURSES='[
   {
     "url": "https://vu.um.ac.ir/course/view.php?id=12345",
+    "title": "optional display title",
     "chatid_bale": "optional_bale_chat",
-    "chatid_tg": "optional_telegram_chat"
+    "chatid_tg": "optional_telegram_chat",
+    "topicid_tg": "optional_telegram_topic_id"
   }
 ]'
 ```
@@ -112,8 +114,10 @@ COURSES='[
 Each item supports:
 
 - `url`: required course URL.
+- `title`: optional. When set, it replaces the course name scraped from VU in every message.
 - `chatid_bale`: optional extra Bale chat for this specific course. Legacy `chatId` is still accepted as a Bale fallback.
 - `chatid_tg`: optional extra Telegram chat for this specific course.
+- `topicid_tg`: optional forum topic (message thread) ID inside `chatid_tg`. `topicid_bale` works the same way for `chatid_bale`.
 
 If the matching per-course chat is set, updates for that course are sent to both the active platform's global chat and the per-course chat. With `API_PROVIDER=BOTH`, Bale uses `chatid_bale` and Telegram uses `chatid_tg`.
 

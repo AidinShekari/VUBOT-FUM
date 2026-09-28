@@ -136,9 +136,13 @@ const getPlatformEnv = (platform, ...names) => {
     });
     return getFirstEnv(...prefixedNames);
 };
+const parseTopicId = (value) => {
+    const parsed = parseInt(String(value || '').trim(), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+};
 const normalizeCourseConfig = (item) => {
     if (typeof item === 'string') {
-        return { url: item.trim(), chatId_bale: '', chatId_tg: '' };
+        return { url: item.trim(), title: '', chatId_bale: '', chatId_tg: '', topicId_bale: null, topicId_tg: null };
     }
     if (!item || typeof item !== 'object') return null;
 
@@ -147,6 +151,7 @@ const normalizeCourseConfig = (item) => {
 
     return {
         url,
+        title: getObjectValue(item, 'title', 'name'),
         chatId_bale: getObjectValue(
             item,
             'chatId_bale',
@@ -163,7 +168,9 @@ const normalizeCourseConfig = (item) => {
             'chatIdTg',
             'telegramChatId',
             'tgChatId'
-        )
+        ),
+        topicId_bale: parseTopicId(getObjectValue(item, 'topicId_bale', 'topicid_bale', 'topicIdBale')),
+        topicId_tg: parseTopicId(getObjectValue(item, 'topicId_tg', 'topicid_tg', 'topicIdTg', 'topicId', 'topicid'))
     };
 };
 const parseCoursesFromEnv = () => {
@@ -223,6 +230,10 @@ const buildCourseChatIdMap = (courses, platform = getActiveChatPlatform()) => {
     return map;
 };
 const COURSES = parseCoursesFromEnv();
+const getCourseConfig = (courseId, courseUrl = '') => COURSES.find(course =>
+    (courseId && getCourseIdFromUrl(course.url) === String(courseId)) ||
+    (courseUrl && course.url === courseUrl)
+) || null;
 const COURSE_URLS = COURSES.map(c => c.url);
 const COURSE_CHAT_ID_MAPS = {
     bale: buildCourseChatIdMap(COURSES, 'bale'),
@@ -407,7 +418,10 @@ class VUMonitor {
                 ? ''
                 : String(targetOrChatId.chatId).trim();
             if (!chatId) return null;
-            return { platform: targetPlatform, chatId };
+            const topicId = parseTopicId(targetOrChatId.topicId);
+            return topicId
+                ? { platform: targetPlatform, chatId, topicId }
+                : { platform: targetPlatform, chatId };
         }
 
         const chatId = targetOrChatId === undefined || targetOrChatId === null
@@ -416,10 +430,15 @@ class VUMonitor {
         if (!chatId) return null;
         return { platform: platform || DEFAULT_PLATFORM, chatId };
     }
-    addTarget(targets, platform, chatId) {
-        const target = this.normalizeChatTarget({ platform, chatId });
+    addTarget(targets, platform, chatId, topicId = null) {
+        const target = this.normalizeChatTarget({ platform, chatId, topicId });
         if (!target) return;
-        targets.set(`${target.platform}:${target.chatId}`, target);
+        targets.set(`${target.platform}:${target.chatId}:${target.topicId || ''}`, target);
+    }
+    getCourseExtraTopicId(courseId, courseUrl = '', platform = DEFAULT_PLATFORM) {
+        const course = getCourseConfig(courseId, courseUrl);
+        if (!course) return null;
+        return platform === 'telegram' ? course.topicId_tg : course.topicId_bale;
     }
     getCourseExtraChatId(courseId, courseUrl = '', platform = DEFAULT_PLATFORM) {
         const map = CONFIG.vu.courseChatIdMaps?.[platform] || {};
@@ -443,7 +462,7 @@ class VUMonitor {
             }
             const extraChatId = this.getCourseExtraChatId(courseId, courseUrl, platform);
             if (extraChatId) {
-                this.addTarget(targets, platform, extraChatId);
+                this.addTarget(targets, platform, extraChatId, this.getCourseExtraTopicId(courseId, courseUrl, platform));
             }
         }
         return Array.from(targets.values());
@@ -501,7 +520,9 @@ class VUMonitor {
         const target = this.normalizeChatTarget(targetOrChatId, platform);
         const platformConfig = target ? this.getPlatformConfig(target.platform) : null;
         const options = { ...baseOptions };
-        if (
+        if (target?.topicId) {
+            options.message_thread_id = target.topicId;
+        } else if (
             platformConfig?.topicId &&
             target &&
             String(target.chatId) === String(platformConfig.globalChatId)
@@ -1382,7 +1403,9 @@ class VUMonitor {
         }
 
         const document = this.parseHtml(coursePage.text);
+        const courseConfig = getCourseConfig(getCourseIdFromUrl(courseUrl), courseUrl);
         const courseName =
+            (courseConfig && courseConfig.title) ||
             this.nodeText(this.queryOne(document, '.breadcrumb li:last-child')) ||
             this.nodeText(this.queryOne(document, '.page-header-headings h1')) ||
             'Unknown Course';
@@ -1401,6 +1424,8 @@ class VUMonitor {
             };
         }
         
+        this.courseData[courseId].name = courseName;
+
         if (!this.courseData[courseId].sentFiles) {
             this.courseData[courseId].sentFiles = {};
         }
@@ -1843,6 +1868,7 @@ class VUMonitor {
                     await this.sendDocumentViaApi({
                         platform: target.platform,
                         chatId: target.chatId,
+                        topicId: target.topicId,
                         buffer,
                         fileName,
                         caption: sendOptions.caption,
@@ -1901,8 +1927,8 @@ class VUMonitor {
             statusCode: response.statusCode
         };
     }
-    async sendDocumentViaApi({ chatId, platform = DEFAULT_PLATFORM, buffer, fileName, caption, contentType, parseMode = 'Markdown' }) {
-        const target = this.normalizeChatTarget({ platform, chatId });
+    async sendDocumentViaApi({ chatId, topicId = null, platform = DEFAULT_PLATFORM, buffer, fileName, caption, contentType, parseMode = 'Markdown' }) {
+        const target = this.normalizeChatTarget({ platform, chatId, topicId });
         if (!target) {
             throw new Error('No valid chat ID provided for sendDocument');
         }
@@ -1920,7 +1946,9 @@ class VUMonitor {
             { name: 'parse_mode', value: parseMode }
         ];
 
-        if (platformConfig.topicId && String(target.chatId) === String(platformConfig.globalChatId)) {
+        if (target.topicId) {
+            fields.push({ name: 'message_thread_id', value: String(target.topicId) });
+        } else if (platformConfig.topicId && String(target.chatId) === String(platformConfig.globalChatId)) {
             fields.push({ name: 'message_thread_id', value: String(platformConfig.topicId) });
         }
 
@@ -3023,6 +3051,7 @@ class VUMonitor {
                                     await this.sendDocumentViaApi({
                                         platform: target.platform,
                                         chatId: target.chatId,
+                                        topicId: target.topicId,
                                         buffer,
                                         fileName: fileInfo.fileName,
                                         caption: formattedCaption.text,
