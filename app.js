@@ -407,9 +407,18 @@ class VUMonitor {
     getStorageKey(targetOrChatId, platform = DEFAULT_PLATFORM) {
         const target = this.normalizeChatTarget(targetOrChatId, platform);
         if (!target) return '';
-        return target.platform === 'bale'
+        const base = target.platform === 'bale'
             ? String(target.chatId)
             : `${target.platform}:${target.chatId}`;
+        return target.topicId ? `${base}#t${target.topicId}` : base;
+    }
+    parseStorageKey(key) {
+        const [base, topicPart] = String(key).split('#t');
+        const target = base.includes(':')
+            ? { platform: base.split(':')[0], chatId: base.split(':').slice(1).join(':') }
+            : { platform: 'bale', chatId: base };
+        const topicId = parseTopicId(topicPart);
+        return topicId ? { ...target, topicId } : target;
     }
     normalizeChatTarget(targetOrChatId, platform = DEFAULT_PLATFORM) {
         if (targetOrChatId && typeof targetOrChatId === 'object') {
@@ -467,24 +476,63 @@ class VUMonitor {
         }
         return Array.from(targets.values());
     }
-    getDeadlineOverviewTargetChatIds() {
+    // Overviews go to the global chat; for a platform with no global chat they fall back
+    // to the course's own chat (and topic, if set).
+    getCourseOverviewTargetChatIds(courseId, courseUrl = '') {
         const targets = new Map();
         for (const platform of CONFIG.activePlatforms) {
             const platformConfig = this.getPlatformConfig(platform);
             if (!platformConfig || !platformConfig.token) continue;
             if (platformConfig.globalChatId) {
                 this.addTarget(targets, platform, platformConfig.globalChatId);
+                continue;
+            }
+            const extraChatId = this.getCourseExtraChatId(courseId, courseUrl, platform);
+            if (extraChatId) {
+                this.addTarget(targets, platform, extraChatId, this.getCourseExtraTopicId(courseId, courseUrl, platform));
             }
         }
         return Array.from(targets.values());
     }
-    getCourseIdsForChatId(chatId, platform = DEFAULT_PLATFORM) {
+    getDeadlineOverviewTargetChatIds() {
+        const targets = new Map();
+        for (const course of COURSES) {
+            const courseId = getCourseIdFromUrl(course.url);
+            for (const target of this.getCourseOverviewTargetChatIds(courseId, course.url)) {
+                targets.set(this.getStorageKey(target), target);
+            }
+        }
+        for (const platform of CONFIG.activePlatforms) {
+            const platformConfig = this.getPlatformConfig(platform);
+            if (platformConfig?.token && platformConfig.globalChatId) {
+                const target = this.normalizeChatTarget({ platform, chatId: platformConfig.globalChatId });
+                targets.set(this.getStorageKey(target), target);
+            }
+        }
+        return Array.from(targets.values());
+    }
+    getAllOverviewStorageKeys() {
+        return new Set(this.getDeadlineOverviewTargetChatIds().map(target => this.getStorageKey(target)));
+    }
+    getCourseIdsForChatId(chatId, platform = DEFAULT_PLATFORM, topicId = undefined) {
         const targetChatId = chatId === undefined || chatId === null
             ? ''
             : String(chatId).trim();
         const courseIds = new Set();
 
         if (!targetChatId) {
+            return courseIds;
+        }
+
+        if (topicId !== undefined) {
+            for (const course of COURSES) {
+                const courseChatId = platform === 'telegram' ? course.chatId_tg : course.chatId_bale;
+                const courseTopicId = platform === 'telegram' ? course.topicId_tg : course.topicId_bale;
+                if (String(courseChatId || '').trim() !== targetChatId) continue;
+                if ((courseTopicId || null) !== (topicId || null)) continue;
+                const courseId = getCourseIdFromUrl(course.url);
+                if (courseId) courseIds.add(courseId);
+            }
             return courseIds;
         }
 
@@ -561,7 +609,7 @@ class VUMonitor {
             .trim();
         return normalized.includes('لیست رویداد ها');
     }
-    extractDeadlineOverviewMessageIdFromUpdate(update, targetChatId) {
+    extractDeadlineOverviewMessageIdFromUpdate(update, targetChatId, targetTopicId = null) {
         const updateKinds = ['message', 'edited_message', 'channel_post', 'edited_channel_post'];
         for (const kind of updateKinds) {
             const payload = update?.[kind];
@@ -569,6 +617,9 @@ class VUMonitor {
                 continue;
             }
             if (String(payload.chat.id) !== String(targetChatId)) {
+                continue;
+            }
+            if (targetTopicId && Number(payload.message_thread_id) !== Number(targetTopicId)) {
                 continue;
             }
             if (!this.isDeadlineOverviewMessageText(payload.text || payload.caption || '')) {
@@ -645,7 +696,7 @@ class VUMonitor {
 
             const foundIds = [];
             for (let i = updates.length - 1; i >= 0; i -= 1) {
-                const messageId = this.extractDeadlineOverviewMessageIdFromUpdate(updates[i], target.chatId);
+                const messageId = this.extractDeadlineOverviewMessageIdFromUpdate(updates[i], target.chatId, target.topicId);
                 if (messageId !== null && !foundIds.includes(messageId)) {
                     foundIds.push(messageId);
                 }
@@ -1490,6 +1541,8 @@ class VUMonitor {
             console.error('Error ensuring stored assignment/quiz details:', err.message);
         }
         
+        await this.retryPendingMessages(courseId);
+        await this.retryPendingFiles(courseId);
         const changes = this.detectChanges(courseId, sections);
         
         if (changes.updatedItems.length > 0) {
@@ -1804,9 +1857,39 @@ class VUMonitor {
             return { success: false, error: error.message };
         }
     }
-    async downloadAndSendFile(fileUrl, fileName, courseId) {
+    // Targets that have not received this file. Older records without a targets list count as
+    // delivered everywhere, unless explicit targets are requested (e.g. an assignment sent to a new topic).
+    getFileTargetsNotYetSent(courseId, fileUrl, requestedTargets = null) {
+        const record = this.courseData[courseId]?.sentFiles?.[fileUrl];
+        const targets = requestedTargets || this.getCourseTargetChatIds(courseId);
+        if (!record) return targets;
+        if (!Array.isArray(record.targets)) return requestedTargets || [];
+        return targets.filter(t => !record.targets.includes(this.getStorageKey(t)));
+    }
+    markFileSent(courseId, fileUrl, fileName, sentTargetKeys, attemptedTargets) {
+        const existing = this.courseData[courseId].sentFiles[fileUrl];
+        const targets = [...new Set([...(existing?.targets || []), ...sentTargetKeys])];
+        this.courseData[courseId].sentFiles[fileUrl] = {
+            sent: targets.length > 0,
+            fileName,
+            sentAt: sentTargetKeys.length > 0 ? new Date().toISOString() : (existing?.sentAt || null),
+            targets,
+            pendingTargets: attemptedTargets.map(t => this.getStorageKey(t)).filter(key => !targets.includes(key))
+        };
+    }
+    async retryPendingFiles(courseId) {
+        const sentFiles = this.courseData[courseId]?.sentFiles || {};
+        for (const [fileUrl, record] of Object.entries(sentFiles)) {
+            if (!Array.isArray(record.pendingTargets) || record.pendingTargets.length === 0) continue;
+            if (this.getFileTargetsNotYetSent(courseId, fileUrl).length === 0) continue;
+            console.log(`🔁 Retrying file "${record.fileName}" to: ${record.pendingTargets.join(', ')}`);
+            await this.downloadAndSendFile(fileUrl, record.fileName, courseId, { silentErrors: true });
+        }
+    }
+    async downloadAndSendFile(fileUrl, fileName, courseId, { silentErrors = false, targets = null } = {}) {
+        const targetChatIds = this.getFileTargetsNotYetSent(courseId, fileUrl, targets);
         try {
-            if (this.courseData[courseId].sentFiles[fileUrl]) {
+            if (targetChatIds.length === 0) {
                 console.log(`📎 File already sent: ${fileName}`);
                 return false;
             }
@@ -1857,42 +1940,49 @@ class VUMonitor {
                 caption: `📎 ${fileName}`
             };
             
+            const sentTargets = new Set();
             if (buffer.length > 5 * 1024 * 1024) {
                 console.log(`⚠️ File too large (${(buffer.length / 1024 / 1024).toFixed(2)} MB), sending link only`);
-                await this.sendTelegramMessage(`📎 فایل خیلی بزرگ است (${(buffer.length / 1024 / 1024).toFixed(2)} MB)\n${fileName}\n🔗 ${fileUrl}`, {
-                    chatIds: this.getCourseTargetChatIds(courseId)
+                const sendResult = await this.sendTelegramMessage(`📎 فایل خیلی بزرگ است (${(buffer.length / 1024 / 1024).toFixed(2)} MB)\n${fileName}\n🔗 ${fileUrl}`, {
+                    chatIds: targetChatIds
                 });
+                sendResult.sentTargets.forEach(key => sentTargets.add(key));
             } else {
-                const targetChatIds = this.getCourseTargetChatIds(courseId);
                 for (const target of targetChatIds) {
-                    await this.sendDocumentViaApi({
-                        platform: target.platform,
-                        chatId: target.chatId,
-                        topicId: target.topicId,
-                        buffer,
-                        fileName,
-                        caption: sendOptions.caption,
-                        contentType
-                    });
+                    try {
+                        await this.sendDocumentViaApi({
+                            platform: target.platform,
+                            chatId: target.chatId,
+                            topicId: target.topicId,
+                            buffer,
+                            fileName,
+                            caption: sendOptions.caption,
+                            contentType
+                        });
+                        sentTargets.add(this.getStorageKey(target));
+                    } catch (error) {
+                        console.error(`❌ Failed to send file to ${target.platform} chat ${target.chatId}:`, error.message);
+                    }
                 }
             }
             
-            this.courseData[courseId].sentFiles[fileUrl] = {
-                sent: true,
-                fileName: fileName,
-                sentAt: new Date().toISOString()
-            };
-            
+            this.markFileSent(courseId, fileUrl, fileName, [...sentTargets], targetChatIds);
             await this.saveData();
             
-            console.log(`✅ File sent: ${fileName}`);
+            if (sentTargets.size === 0) {
+                return false;
+            }
+            console.log(`✅ File sent: ${fileName} (${[...sentTargets].join(', ')})`);
             return true;
         } catch (error) {
             console.error(`❌ Error downloading/sending file ${fileName}:`, error.message);
+            if (silentErrors) {
+                return false;
+            }
             
             try {
                 await this.sendTelegramMessage(`⚠️ خطا در دانلود فایل\n📎 ${fileName}\n🔗 ${fileUrl}`, {
-                    chatIds: this.getCourseTargetChatIds(courseId)
+                    chatIds: targetChatIds
                 });
             } catch (telegramError) {
                 console.error('Failed to send error message:', telegramError.message);
@@ -2037,6 +2127,17 @@ class VUMonitor {
                         section: sectionName,
                         activity: activity
                     });
+                } else if (
+                    this.courseData[courseId]?.sentNotifications?.[activity.url] &&
+                    this.getTargetsNotYetNotified(courseId, activity.url).length > 0
+                ) {
+                    // Delivered to some chats but not others (failed, or a chat/topic added later) — send only to the missing ones.
+                    changes.hasChanges = true;
+                    changes.newItems.push({
+                        section: sectionName,
+                        activity: activity,
+                        retry: true
+                    });
                 } else {
                     const activityType = activity.type;
                     if (activityType === 'assign' || activityType === 'mod_assign' ||
@@ -2090,17 +2191,11 @@ class VUMonitor {
             disable_web_page_preview: true
         };
 
-        // Send overview to global chats ONLY — not to per-course extra chats.
-        const globalTargets = CONFIG.activePlatforms
-            .map(platform => {
-                const platformConfig = this.getPlatformConfig(platform);
-                if (!platformConfig?.token || !platformConfig.globalChatId) return null;
-                return { platform, chatId: String(platformConfig.globalChatId) };
-            })
-            .filter(Boolean);
+        // Global chat per platform; falls back to the course's own chat/topic when there is no global chat.
+        const globalTargets = this.getCourseOverviewTargetChatIds(courseId, courseUrl);
 
         if (globalTargets.length === 0) {
-            console.log(`⚠️ No global chat ID configured; skipping course overview for ${courseId}`);
+            console.log(`⚠️ No global or course chat ID configured; skipping course overview for ${courseId}`);
             return;
         }
 
@@ -2173,13 +2268,7 @@ class VUMonitor {
     // ─── Startup cleanup: delete any overview messages sent to non-global chats
     // and any previously sent per-course overview messages stored in message_ids.json
     async cleanupNonGlobalOverviewMessages() {
-        const globalKeys = new Set(CONFIG.activePlatforms
-            .map(platform => {
-                const platformConfig = this.getPlatformConfig(platform);
-                if (!platformConfig?.globalChatId) return null;
-                return this.getStorageKey({ platform, chatId: platformConfig.globalChatId });
-            })
-            .filter(Boolean));
+        const globalKeys = this.getAllOverviewStorageKeys();
         let changed = false;
 
         for (const [courseId, stored] of Object.entries(this.courseMessageIds || {})) {
@@ -2195,7 +2284,7 @@ class VUMonitor {
 
                 if (Array.isArray(messageIds)) {
                     for (const messageId of messageIds) {
-                        await this.deleteTelegramMessage(chatId, messageId);
+                        await this.deleteTelegramMessage(this.parseStorageKey(chatId), messageId);
                     }
                 }
 
@@ -2211,22 +2300,14 @@ class VUMonitor {
         }
     }
     async cleanupPerCourseDeadlineMessages() {
-        const globalKeys = new Set(CONFIG.activePlatforms
-            .map(platform => {
-                const platformConfig = this.getPlatformConfig(platform);
-                if (!platformConfig?.globalChatId) return null;
-                return this.getStorageKey({ platform, chatId: platformConfig.globalChatId });
-            })
-            .filter(Boolean));
+        const globalKeys = this.getAllOverviewStorageKeys();
 
         const keysToRemove = Object.keys(this.deadlineMessageIds).filter(k => !globalKeys.has(k));
         if (keysToRemove.length === 0) return;
 
         for (const key of keysToRemove) {
             const messageId = this.deadlineMessageIds[key];
-            const target = key.includes(':')
-                ? { platform: key.split(':')[0], chatId: key.split(':').slice(1).join(':') }
-                : { platform: 'bale', chatId: key };
+            const target = this.parseStorageKey(key);
             await this.deleteTelegramMessage(target, messageId);
             delete this.deadlineMessageIds[key];
             console.log(`🧹 Deleted per-course deadline message from ${target.platform} chat ${target.chatId}`);
@@ -2448,7 +2529,7 @@ class VUMonitor {
 
             let chatDeadlines = allDeadlines;
             if (!isGlobalChat) {
-                const allowedCourseIds = this.getCourseIdsForChatId(chatId, target.platform);
+                const allowedCourseIds = this.getCourseIdsForChatId(chatId, target.platform, target.topicId || null);
                 chatDeadlines = allowedCourseIds.size > 0
                     ? allDeadlines.filter(item => allowedCourseIds.has(String(item.courseId)))
                     : [];
@@ -2553,6 +2634,44 @@ class VUMonitor {
             historyIds: this.deadlineMessageHistoryIds
         }, null, 2));
     }
+    // Sends to all course chats; platforms that fail are queued and retried on the next cycle
+    // without re-sending to platforms that already got the message.
+    async sendCourseMessageWithRetry(courseId, message, options = {}, platforms = CONFIG.activePlatforms) {
+        const targets = this.getCourseTargetChatIds(courseId).filter(t => platforms.includes(t.platform));
+        const attemptedPlatforms = [...new Set(targets.map(t => t.platform))];
+        if (attemptedPlatforms.length === 0) return;
+        const sendResult = await this.sendTelegramMessage(message, { ...options, chatIds: targets });
+        const failedPlatforms = attemptedPlatforms.filter(platform => !sendResult.sentPlatforms.includes(platform));
+        if (failedPlatforms.length === 0) return;
+        const course = this.courseData[courseId];
+        if (!Array.isArray(course.pendingMessages)) course.pendingMessages = [];
+        course.pendingMessages.push({
+            message,
+            options,
+            platforms: failedPlatforms,
+            createdAt: new Date().toISOString()
+        });
+        console.log(`🔁 Update not delivered on: ${failedPlatforms.join(', ')} — will retry next cycle`);
+    }
+    async retryPendingMessages(courseId) {
+        const course = this.courseData[courseId];
+        if (!Array.isArray(course?.pendingMessages) || course.pendingMessages.length === 0) return;
+        const maxAgeMs = 3 * 24 * 60 * 60 * 1000;
+        const queue = course.pendingMessages.filter(entry => Date.now() - new Date(entry.createdAt).getTime() < maxAgeMs);
+        course.pendingMessages = [];
+        for (const entry of queue) {
+            const platforms = entry.platforms.filter(platform => CONFIG.activePlatforms.includes(platform));
+            if (platforms.length === 0) continue;
+            console.log(`🔁 Retrying pending update on: ${platforms.join(', ')}`);
+            const before = course.pendingMessages.length;
+            await this.sendCourseMessageWithRetry(courseId, entry.message, entry.options, platforms);
+            // Keep the original timestamp so a permanently failing message eventually expires.
+            for (let i = before; i < course.pendingMessages.length; i++) {
+                course.pendingMessages[i].createdAt = entry.createdAt;
+            }
+        }
+        await this.saveData();
+    }
     async checkForUpdates(courseId, courseName, updatedItems) {
         for (const item of updatedItems) {
             try {
@@ -2656,8 +2775,7 @@ class VUMonitor {
                             item.activity.url,
                             newDetails.deadline
                         );
-                        await this.sendTelegramMessage(updateMessage, {
-                            chatIds: this.getCourseTargetChatIds(courseId),
+                        await this.sendCourseMessageWithRetry(courseId, updateMessage, {
                             reply_markup: {
                                 inline_keyboard: [
                                     [this.styledUrlButton('مشاهده تمرین', item.activity.url, 'primary')],
@@ -2759,8 +2877,7 @@ class VUMonitor {
                     }
                     
                     if (hasUpdate) {
-                        await this.sendTelegramMessage(updateMessage, {
-                            chatIds: this.getCourseTargetChatIds(courseId),
+                        await this.sendCourseMessageWithRetry(courseId, updateMessage, {
                             reply_markup: {
                                 inline_keyboard: [[
                                     this.styledUrlButton('مشاهده آزمون', item.activity.url, 'primary')
@@ -2782,12 +2899,11 @@ class VUMonitor {
             const activityType = item.activity.type;
             
             if (activityType === 'assign' || activityType === 'mod_assign') {
-                const platformsToNotify = this.getPlatformsNotYetNotified(courseId, item.activity.url);
-                if (platformsToNotify.length === 0) {
+                const notifyTargets = this.getTargetsNotYetNotified(courseId, item.activity.url);
+                if (notifyTargets.length === 0) {
                     console.log(`📭 Notification already sent for: ${item.activity.name}`);
                     continue;
                 }
-                const notifyTargets = this.getCourseTargetChatIds(courseId).filter(t => platformsToNotify.includes(t.platform));
 
                 let message = this.buildNewAssignmentMessage(courseName, item.section, item.activity.name);
 
@@ -2830,15 +2946,14 @@ class VUMonitor {
                         console.log(`📎 Found ${details.attachments.length} attachment(s) for assignment`);
 
                         for (const att of details.attachments) {
-                            await this.downloadAndSendFile(att.url, att.fileName, courseId);
+                            await this.downloadAndSendFile(att.url, att.fileName, courseId, { targets: notifyTargets });
                             await new Promise(r => setTimeout(r, 1000));
                         }
                     }
 
                     this.courseData[courseId].assignments[item.activity.url] = details;
-                    const sentPlatforms = platformsToNotify.filter(platform => sendResult.sentPlatforms.includes(platform));
-                    if (sentPlatforms.length > 0) {
-                        this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                    this.markNotificationSent(courseId, item.activity.url, sendResult.sentTargets, item.activity.name, notifyTargets);
+                    if (sendResult.sentTargets.length > 0) {
                         this.recordNotificationMessageIds(courseId, item.activity.url, sendResult.sentMessages);
                     }
 
@@ -2856,9 +2971,8 @@ class VUMonitor {
                                 ]
                             }
                         });
-                        const sentPlatforms = platformsToNotify.filter(platform => fallbackResult.sentPlatforms.includes(platform));
-                        if (sentPlatforms.length > 0) {
-                            this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                        this.markNotificationSent(courseId, item.activity.url, fallbackResult.sentTargets, item.activity.name, notifyTargets);
+                        if (fallbackResult.sentTargets.length > 0) {
                             this.recordNotificationMessageIds(courseId, item.activity.url, fallbackResult.sentMessages);
                             await this.saveData();
                         }
@@ -2866,12 +2980,11 @@ class VUMonitor {
                 }
             }
             else if (activityType === 'quiz' || activityType === 'mod_quiz') {
-                const platformsToNotify = this.getPlatformsNotYetNotified(courseId, item.activity.url);
-                if (platformsToNotify.length === 0) {
+                const notifyTargets = this.getTargetsNotYetNotified(courseId, item.activity.url);
+                if (notifyTargets.length === 0) {
                     console.log(`📭 Notification already sent for: ${item.activity.name}`);
                     continue;
                 }
-                const notifyTargets = this.getCourseTargetChatIds(courseId).filter(t => platformsToNotify.includes(t.platform));
 
                 let message = `🆕 <b>آزمون جدید</b>\n\n`;
                 message += `🎓 درس: ${courseName}\n`;
@@ -2942,9 +3055,8 @@ class VUMonitor {
                         }
                     });
 
-                    const sentPlatforms = platformsToNotify.filter(platform => sendResult.sentPlatforms.includes(platform));
-                    if (sentPlatforms.length > 0) {
-                        this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                    this.markNotificationSent(courseId, item.activity.url, sendResult.sentTargets, item.activity.name, notifyTargets);
+                    if (sendResult.sentTargets.length > 0) {
                         this.recordNotificationMessageIds(courseId, item.activity.url, sendResult.sentMessages);
                     }
                     this.courseData[courseId].assignments[item.activity.url] = details;
@@ -2962,27 +3074,25 @@ class VUMonitor {
                         }
                     });
 
-                    const sentPlatforms = platformsToNotify.filter(platform => fallbackResult.sentPlatforms.includes(platform));
-                    if (sentPlatforms.length > 0) {
-                        this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                    this.markNotificationSent(courseId, item.activity.url, fallbackResult.sentTargets, item.activity.name, notifyTargets);
+                    if (fallbackResult.sentTargets.length > 0) {
                         this.recordNotificationMessageIds(courseId, item.activity.url, fallbackResult.sentMessages);
                     }
                     await this.saveData();
                 }
             }
             else if (activityType === 'resource' || activityType === 'mod_resource') {
-                const platformsToNotify = this.getPlatformsNotYetNotified(courseId, item.activity.url);
-                if (platformsToNotify.length === 0) {
+                const notifyTargets = this.getTargetsNotYetNotified(courseId, item.activity.url);
+                if (notifyTargets.length === 0) {
                     console.log(`📭 Notification already sent for: ${item.activity.name}`);
                     continue;
                 }
-                const notifyTargets = this.getCourseTargetChatIds(courseId).filter(t => platformsToNotify.includes(t.platform));
 
                 let message = `🆕 <b>فایل جدید</b>\n\n`;
                 message += `🎓 درس: ${courseName}\n`;
                 message += `📂 بخش: ${item.section}\n\n`;
                 message += `📁 ${item.activity.name}\n`;
-                const resourceSentPlatforms = new Set();
+                const resourceSentTargets = new Set();
 
                 try {
                     console.log(`📥 Extracting file URL for: ${item.activity.name}`);
@@ -3058,7 +3168,7 @@ class VUMonitor {
                                         parseMode: formattedCaption.parse_mode,
                                         contentType
                                     });
-                                    resourceSentPlatforms.add(target.platform);
+                                    resourceSentTargets.add(this.getStorageKey(target));
                                 } catch (error) {
                                     console.error(`❌ Failed to send file to ${target.platform} chat ${target.chatId}:`, error.message);
                                 }
@@ -3076,7 +3186,7 @@ class VUMonitor {
                                     ]]
                                 }
                             });
-                            sendResult.sentPlatforms.forEach(platform => resourceSentPlatforms.add(platform));
+                            sendResult.sentTargets.forEach(key => resourceSentTargets.add(key));
                         }
                     } else {
                         console.log(`⚠️ Could not extract file URL for: ${item.activity.name}`);
@@ -3089,7 +3199,7 @@ class VUMonitor {
                                 ]]
                             }
                         });
-                        sendResult.sentPlatforms.forEach(platform => resourceSentPlatforms.add(platform));
+                        sendResult.sentTargets.forEach(key => resourceSentTargets.add(key));
                     }
                 } catch (error) {
                     console.error(`❌ Error downloading resource file: ${error.message}`);
@@ -3102,12 +3212,11 @@ class VUMonitor {
                             ]]
                         }
                     });
-                    sendResult.sentPlatforms.forEach(platform => resourceSentPlatforms.add(platform));
+                    sendResult.sentTargets.forEach(key => resourceSentTargets.add(key));
                 }
 
-                const sentPlatforms = platformsToNotify.filter(platform => resourceSentPlatforms.has(platform));
-                if (sentPlatforms.length > 0) {
-                    this.markNotificationSent(courseId, item.activity.url, sentPlatforms, item.activity.name);
+                this.markNotificationSent(courseId, item.activity.url, [...resourceSentTargets], item.activity.name, notifyTargets);
+                if (resourceSentTargets.size > 0) {
                 }
                 await this.saveData();
 
@@ -3139,25 +3248,42 @@ class VUMonitor {
 
         return emojiMap[activityType] || '📌';
     }
-    getPlatformsNotYetNotified(courseId, url) {
-        const record = this.courseData[courseId]?.sentNotifications?.[url];
-        if (!record) return [...CONFIG.activePlatforms];
+    // Keys of course targets (chat + topic) that already received this notification.
+    // Older records only know platforms: treat every current target of a delivered platform as delivered.
+    getDeliveredTargetKeys(record, targets) {
+        if (!record) return [];
+        if (Array.isArray(record.targets)) return record.targets;
         const sentPlatforms = record.platforms || (record.sent ? [DEFAULT_PLATFORM] : []);
-        return CONFIG.activePlatforms.filter(p => !sentPlatforms.includes(p));
+        return targets.filter(t => sentPlatforms.includes(t.platform)).map(t => this.getStorageKey(t));
     }
-    markNotificationSent(courseId, url, platforms, activityName) {
-        const existing = this.courseData[courseId].sentNotifications?.[url];
-        const prevPlatforms = existing?.platforms || (existing?.sent ? [DEFAULT_PLATFORM] : []);
+    getTargetsNotYetNotified(courseId, url) {
+        const record = this.courseData[courseId]?.sentNotifications?.[url];
+        const targets = this.getCourseTargetChatIds(courseId);
+        const delivered = this.getDeliveredTargetKeys(record, targets);
+        return targets.filter(t => !delivered.includes(this.getStorageKey(t)));
+    }
+    markNotificationSent(courseId, url, sentTargetKeys, activityName, attemptedTargets = []) {
+        if (!this.courseData[courseId].sentNotifications) {
+            this.courseData[courseId].sentNotifications = {};
+        }
+        const existing = this.courseData[courseId].sentNotifications[url];
+        const courseTargets = this.getCourseTargetChatIds(courseId);
+        const targets = [...new Set([...this.getDeliveredTargetKeys(existing, courseTargets), ...sentTargetKeys])];
+        const failed = attemptedTargets.map(t => this.getStorageKey(t)).filter(key => !targets.includes(key));
         const prevMessageIds = existing?.messageIds && typeof existing.messageIds === 'object' && !Array.isArray(existing.messageIds)
             ? { ...existing.messageIds }
             : {};
         this.courseData[courseId].sentNotifications[url] = {
-            sent: true,
-            sentAt: new Date().toISOString(),
+            sent: targets.length > 0,
+            sentAt: sentTargetKeys.length > 0 ? new Date().toISOString() : (existing?.sentAt || null),
             activityName,
-            platforms: [...new Set([...prevPlatforms, ...platforms])],
+            platforms: [...new Set(targets.map(key => this.parseStorageKey(key).platform))],
+            targets,
             messageIds: prevMessageIds
         };
+        if (failed.length > 0) {
+            console.log(`🔁 "${activityName}" not delivered to: ${failed.join(', ')} — will retry next cycle`);
+        }
     }
     recordNotificationMessageIds(courseId, url, sentMessages = []) {
         const record = this.courseData[courseId]?.sentNotifications?.[url];
@@ -3675,10 +3801,11 @@ class VUMonitor {
 
             if (targets.length === 0) {
                 console.log('⚠️ No valid chat ID configured for this message');
-                return { ok: false, sentPlatforms: [], sentMessages: [] };
+                return { ok: false, sentPlatforms: [], sentTargets: [], sentMessages: [] };
             }
 
             const sentPlatforms = [];
+            const sentTargets = [];
             const sentMessages = [];
             let failedCount = 0;
             for (const target of targets) {
@@ -3693,6 +3820,7 @@ class VUMonitor {
                 try {
                     const sentMessage = await getBot(target.platform).sendMessage(target.chatId, formatted.text, sendOptions);
                     sentPlatforms.push(target.platform);
+                    sentTargets.push(this.getStorageKey(target));
                     const messageId = this.normalizeMessageId(sentMessage?.message_id);
                     if (messageId !== null) {
                         sentMessages.push({
@@ -3709,14 +3837,14 @@ class VUMonitor {
 
             const uniqueSentPlatforms = [...new Set(sentPlatforms)];
             if (failedCount > 0) {
-                return { ok: false, sentPlatforms: uniqueSentPlatforms, sentMessages };
+                return { ok: false, sentPlatforms: uniqueSentPlatforms, sentTargets, sentMessages };
             }
 
             console.log('✅ Bot notification sent');
-            return { ok: true, sentPlatforms: uniqueSentPlatforms, sentMessages };
+            return { ok: true, sentPlatforms: uniqueSentPlatforms, sentTargets, sentMessages };
         } catch (error) {
             console.error('❌ Failed to send bot message:', error.message);
-            return { ok: false, sentPlatforms: [], sentMessages: [] };
+            return { ok: false, sentPlatforms: [], sentTargets: [], sentMessages: [] };
         }
     }
     async sendCourseOverview(courseId) {
