@@ -121,6 +121,32 @@ Each item supports:
 
 If the matching per-course chat is set, updates for that course are sent to both the active platform's global chat and the per-course chat. With `API_PROVIDER=BOTH`, Bale uses `chatid_bale` and Telegram uses `chatid_tg`.
 
+To send a course to several chats or channels, use an array. Each entry is a chat ID or an object with its own topic:
+
+```env
+COURSES='[
+  {
+    "url": "https://vu.um.ac.ir/course/view.php?id=12345",
+    "title": "Numerical Methods",
+    "chatid_bale": ["111111", "222222"],
+    "chatid_tg": [
+      "-1001111111111",
+      { "chatid": "-1002222222222", "topicid": "497" }
+    ]
+  }
+]'
+```
+
+When you add a new chat or topic, it receives the course's still-relevant items (open assignments and quizzes, files) that it hasn't received yet. Chats that already got them are not messaged again.
+
+If a chat is missing items the bot thinks it already sent (for example after changing chat IDs), force a resend. Stop the bot first so it doesn't overwrite the data file:
+
+```bash
+pm2 stop VU
+node app.js --resend 38600 bale        # or: telegram, or a chat key like telegram:-1003597584772#t497
+pm2 start VU
+```
+
 Legacy comma-separated config is still supported:
 
 ```env

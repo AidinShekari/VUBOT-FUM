@@ -140,9 +140,33 @@ const parseTopicId = (value) => {
     const parsed = parseInt(String(value || '').trim(), 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 };
+// A course chat field may be a single chat ("-100123", optionally with a topic field next to it),
+// a comma-separated list, or an array of chat IDs / {"chatid": "...", "topicid": "..."} objects.
+const parseCourseChats = (item, chatKeys, topicKeys) => {
+    const rawKey = chatKeys.find(key => item[key] !== undefined && item[key] !== null && item[key] !== '');
+    const raw = rawKey ? item[rawKey] : undefined;
+    const sharedTopicId = parseTopicId(getObjectValue(item, ...topicKeys));
+    const entries = Array.isArray(raw) ? raw : (raw === undefined ? [] : String(raw).split(','));
+    const chats = [];
+    for (const entry of entries) {
+        let chatId = '';
+        let topicId = null;
+        if (entry && typeof entry === 'object') {
+            chatId = getObjectValue(entry, 'chatid', 'chatId', 'chat_id', 'id');
+            topicId = parseTopicId(getObjectValue(entry, 'topicid', 'topicId', 'topic_id', 'topic'));
+        } else {
+            chatId = String(entry === undefined || entry === null ? '' : entry).trim();
+            topicId = Array.isArray(raw) ? null : sharedTopicId;
+        }
+        if (chatId && !chats.some(chat => chat.chatId === chatId && chat.topicId === topicId)) {
+            chats.push({ chatId, topicId });
+        }
+    }
+    return chats;
+};
 const normalizeCourseConfig = (item) => {
     if (typeof item === 'string') {
-        return { url: item.trim(), title: '', chatId_bale: '', chatId_tg: '', topicId_bale: null, topicId_tg: null };
+        return { url: item.trim(), title: '', chats: { bale: [], telegram: [] } };
     }
     if (!item || typeof item !== 'object') return null;
 
@@ -152,25 +176,18 @@ const normalizeCourseConfig = (item) => {
     return {
         url,
         title: getObjectValue(item, 'title', 'name'),
-        chatId_bale: getObjectValue(
-            item,
-            'chatId_bale',
-            'chatid_bale',
-            'chatIdBale',
-            'baleChatId',
-            'chatId',
-            'chatid'
-        ),
-        chatId_tg: getObjectValue(
-            item,
-            'chatId_tg',
-            'chatid_tg',
-            'chatIdTg',
-            'telegramChatId',
-            'tgChatId'
-        ),
-        topicId_bale: parseTopicId(getObjectValue(item, 'topicId_bale', 'topicid_bale', 'topicIdBale')),
-        topicId_tg: parseTopicId(getObjectValue(item, 'topicId_tg', 'topicid_tg', 'topicIdTg', 'topicId', 'topicid'))
+        chats: {
+            bale: parseCourseChats(
+                item,
+                ['chats_bale', 'chatId_bale', 'chatid_bale', 'chatIdBale', 'baleChatId', 'chatId', 'chatid'],
+                ['topicId_bale', 'topicid_bale', 'topicIdBale']
+            ),
+            telegram: parseCourseChats(
+                item,
+                ['chats_tg', 'chatId_tg', 'chatid_tg', 'chatIdTg', 'telegramChatId', 'tgChatId'],
+                ['topicId_tg', 'topicid_tg', 'topicIdTg', 'topicId', 'topicid']
+            )
+        }
     };
 };
 const parseCoursesFromEnv = () => {
@@ -200,11 +217,11 @@ const parseCoursesFromEnv = () => {
         process.env.COURSE_TG_CHAT_IDS ||
         process.env.COURSE_TELEGRAM_CHAT_IDS
     );
-    return legacyUrls.map((url, i) => ({
+    return legacyUrls.map((url, i) => normalizeCourseConfig({
         url,
-        chatId_bale: (legacyBaleChatIds[i] || '').trim(),
-        chatId_tg: (legacyTelegramChatIds[i] || '').trim()
-    }));
+        chatid_bale: (legacyBaleChatIds[i] || '').trim(),
+        chatid_tg: (legacyTelegramChatIds[i] || '').trim()
+    })).filter(Boolean);
 };
 const getCourseIdFromUrl = (url) => {
     try {
@@ -213,32 +230,12 @@ const getCourseIdFromUrl = (url) => {
         return '';
     }
 };
-const buildCourseChatIdMap = (courses, platform = getActiveChatPlatform()) => {
-    const map = {};
-    const chatIdKey = platform === 'telegram' ? 'chatId_tg' : 'chatId_bale';
-    for (const course of courses) {
-        const url = (course && course.url ? String(course.url) : '').trim();
-        const chatId = (course && course[chatIdKey] ? String(course[chatIdKey]) : '').trim();
-        if (!url) continue;
-        if (!chatId) continue;
-        const courseId = getCourseIdFromUrl(url);
-        if (courseId) {
-            map[courseId] = chatId;
-        }
-        map[url] = chatId;
-    }
-    return map;
-};
 const COURSES = parseCoursesFromEnv();
 const getCourseConfig = (courseId, courseUrl = '') => COURSES.find(course =>
     (courseId && getCourseIdFromUrl(course.url) === String(courseId)) ||
     (courseUrl && course.url === courseUrl)
 ) || null;
 const COURSE_URLS = COURSES.map(c => c.url);
-const COURSE_CHAT_ID_MAPS = {
-    bale: buildCourseChatIdMap(COURSES, 'bale'),
-    telegram: buildCourseChatIdMap(COURSES, 'telegram')
-};
 const getGlobalChatId = (platform) => platform === 'telegram'
     ? getFirstEnv(
         'GLOBAL_CHAT_ID_TG',
@@ -295,8 +292,7 @@ const buildPlatformConfig = (platform) => ({
     socksProxy: platform === 'telegram'
         ? normalizeSocksProxyUrl(getFirstEnv('TG_SOCKS_PROXY', 'TELEGRAM_SOCKS_PROXY', 'SOCKS_PROXY'), platform)
         : '',
-    pollingEnabled: parseBoolean(getPlatformEnv(platform, 'BOT_POLLING', 'POLLING', 'ENABLE_POLLING'), false),
-    courseChatIdMap: COURSE_CHAT_ID_MAPS[platform] || {}
+    pollingEnabled: parseBoolean(getPlatformEnv(platform, 'BOT_POLLING', 'POLLING', 'ENABLE_POLLING'), false)
 });
 const PLATFORM_CONFIGS = {
     bale: buildPlatformConfig('bale'),
@@ -311,9 +307,7 @@ const CONFIG = {
     vu: {
         username: process.env.VU_USERNAME || process.env.VU_USER || '',
         password: process.env.VU_PASSWORD || process.env.VU_PASS || '',
-        courseUrls: COURSE_URLS,
-        courseChatIdMap: COURSE_CHAT_ID_MAPS[DEFAULT_PLATFORM],
-        courseChatIdMaps: COURSE_CHAT_ID_MAPS
+        courseUrls: COURSE_URLS
     },
     checkInterval: parseInt(process.env.CHECK_INTERVAL) || 5,
     debug: process.env.DEBUG_MODE === 'true' || false,
@@ -444,20 +438,9 @@ class VUMonitor {
         if (!target) return;
         targets.set(`${target.platform}:${target.chatId}:${target.topicId || ''}`, target);
     }
-    getCourseExtraTopicId(courseId, courseUrl = '', platform = DEFAULT_PLATFORM) {
+    getCourseChats(courseId, courseUrl = '', platform = DEFAULT_PLATFORM) {
         const course = getCourseConfig(courseId, courseUrl);
-        if (!course) return null;
-        return platform === 'telegram' ? course.topicId_tg : course.topicId_bale;
-    }
-    getCourseExtraChatId(courseId, courseUrl = '', platform = DEFAULT_PLATFORM) {
-        const map = CONFIG.vu.courseChatIdMaps?.[platform] || {};
-        if (courseId && map[courseId]) {
-            return map[courseId];
-        }
-        if (courseUrl && map[courseUrl]) {
-            return map[courseUrl];
-        }
-        return null;
+        return course?.chats?.[platform] || [];
     }
     getCourseTargetChatIds(courseId, courseUrl = '') {
         const targets = new Map();
@@ -469,15 +452,14 @@ class VUMonitor {
             if (platformConfig.globalChatId) {
                 this.addTarget(targets, platform, platformConfig.globalChatId);
             }
-            const extraChatId = this.getCourseExtraChatId(courseId, courseUrl, platform);
-            if (extraChatId) {
-                this.addTarget(targets, platform, extraChatId, this.getCourseExtraTopicId(courseId, courseUrl, platform));
+            for (const chat of this.getCourseChats(courseId, courseUrl, platform)) {
+                this.addTarget(targets, platform, chat.chatId, chat.topicId);
             }
         }
         return Array.from(targets.values());
     }
     // Overviews go to the global chat; for a platform with no global chat they fall back
-    // to the course's own chat (and topic, if set).
+    // to every chat (and topic, if set) configured for the course.
     getCourseOverviewTargetChatIds(courseId, courseUrl = '') {
         const targets = new Map();
         for (const platform of CONFIG.activePlatforms) {
@@ -487,9 +469,8 @@ class VUMonitor {
                 this.addTarget(targets, platform, platformConfig.globalChatId);
                 continue;
             }
-            const extraChatId = this.getCourseExtraChatId(courseId, courseUrl, platform);
-            if (extraChatId) {
-                this.addTarget(targets, platform, extraChatId, this.getCourseExtraTopicId(courseId, courseUrl, platform));
+            for (const chat of this.getCourseChats(courseId, courseUrl, platform)) {
+                this.addTarget(targets, platform, chat.chatId, chat.topicId);
             }
         }
         return Array.from(targets.values());
@@ -514,44 +495,26 @@ class VUMonitor {
     getAllOverviewStorageKeys() {
         return new Set(this.getDeadlineOverviewTargetChatIds().map(target => this.getStorageKey(target)));
     }
+    // Course IDs configured for a chat. With topicId given, only courses on that exact topic
+    // (null = the chat itself, without a topic).
     getCourseIdsForChatId(chatId, platform = DEFAULT_PLATFORM, topicId = undefined) {
         const targetChatId = chatId === undefined || chatId === null
             ? ''
             : String(chatId).trim();
         const courseIds = new Set();
-
         if (!targetChatId) {
             return courseIds;
         }
-
-        if (topicId !== undefined) {
-            for (const course of COURSES) {
-                const courseChatId = platform === 'telegram' ? course.chatId_tg : course.chatId_bale;
-                const courseTopicId = platform === 'telegram' ? course.topicId_tg : course.topicId_bale;
-                if (String(courseChatId || '').trim() !== targetChatId) continue;
-                if ((courseTopicId || null) !== (topicId || null)) continue;
-                const courseId = getCourseIdFromUrl(course.url);
-                if (courseId) courseIds.add(courseId);
-            }
-            return courseIds;
-        }
-
-        const map = CONFIG.vu.courseChatIdMaps?.[platform] || {};
-        for (const [key, mappedChatId] of Object.entries(map)) {
-            const normalizedMappedChatId = mappedChatId === undefined || mappedChatId === null
-                ? ''
-                : String(mappedChatId).trim();
-
-            if (normalizedMappedChatId !== targetChatId) {
-                continue;
-            }
-
-            const courseId = getCourseIdFromUrl(key) || String(key).trim();
-            if (courseId) {
+        for (const course of COURSES) {
+            const matches = (course.chats?.[platform] || []).some(chat =>
+                chat.chatId === targetChatId &&
+                (topicId === undefined || (chat.topicId || null) === (topicId || null))
+            );
+            const courseId = getCourseIdFromUrl(course.url);
+            if (matches && courseId) {
                 courseIds.add(courseId);
             }
         }
-
         return courseIds;
     }
     normalizeMessageId(rawMessageId) {
@@ -2265,10 +2228,10 @@ class VUMonitor {
 
         console.log(`✏️ Updated overview message for course ${courseId} in ${maxMessageParts} part(s)`);
     }
-    // ─── Startup cleanup: delete any overview messages sent to non-global chats
-    // and any previously sent per-course overview messages stored in message_ids.json
+    // ─── Startup cleanup: remove overview messages whose target is no longer
+    // configured for that course. Per-course chats/topics are valid targets when
+    // no global chat is configured, so they must be preserved across restarts.
     async cleanupNonGlobalOverviewMessages() {
-        const globalKeys = this.getAllOverviewStorageKeys();
         let changed = false;
 
         for (const [courseId, stored] of Object.entries(this.courseMessageIds || {})) {
@@ -2276,9 +2239,16 @@ class VUMonitor {
                 continue;
             }
 
+            const courseConfig = COURSES.find(course => getCourseIdFromUrl(course.url) === String(courseId));
+            const expectedKeys = new Set(courseConfig
+                ? this.getCourseOverviewTargetChatIds(courseId, courseConfig.url)
+                    .map(target => this.getStorageKey(target))
+                : []);
+
             for (const [chatId, messageIds] of Object.entries(stored)) {
-                // Keep global chat messages — delete everything else
-                if (globalKeys.has(String(chatId))) {
+                // Keep every target that is still configured for this course,
+                // including per-course Telegram topics and Bale chats.
+                if (expectedKeys.has(String(chatId))) {
                     continue;
                 }
 
@@ -2290,13 +2260,13 @@ class VUMonitor {
 
                 delete this.courseMessageIds[courseId][chatId];
                 changed = true;
-                console.log(`🧹 Removed course overview messages for course ${courseId} from chat ${chatId}`);
+                console.log(`🧹 Removed stale course overview messages for course ${courseId} from chat ${chatId}`);
             }
         }
 
         if (changed) {
             await fs.writeFile('message_ids.json', JSON.stringify(this.courseMessageIds, null, 2));
-            console.log('✅ Cleaned non-global overview message IDs');
+            console.log('✅ Cleaned stale overview message IDs');
         }
     }
     async cleanupPerCourseDeadlineMessages() {
@@ -3146,9 +3116,12 @@ class VUMonitor {
                         }
 
                         const fileSizeMB = buffer.length / (1024 * 1024);
+                        const isVideo = String(contentType || '').toLowerCase().startsWith('video/') ||
+                            /\.(mp4|m4v|mov|mkv|avi|webm|mpeg|mpg|wmv|flv)$/i.test(fileInfo.fileName || '');
+                        const shouldSendLinkOnly = fileSizeMB > 100 || (isVideo && fileSizeMB > 50);
                         console.log(`📄 File size: ${fileSizeMB.toFixed(2)} MB, Content-Type: ${contentType}`);
 
-                        if (fileSizeMB <= 100) {
+                        if (!shouldSendLinkOnly) {
                             let caption = `🆕 <b>فایل جدید</b>\n\n`;
                             caption += `🎓 درس: ${courseName}\n`;
                             caption += `📂 بخش: ${item.section}\n\n`;
@@ -3175,8 +3148,12 @@ class VUMonitor {
                             }
                             console.log(`✅ File uploaded: ${fileInfo.fileName}`);
                         } else {
+                            console.log(`🔗 Sending link only for ${isVideo ? 'large video' : 'large file'}: ${fileInfo.fileName}`);
                             message += `🔗 ${item.activity.url}\n`;
-                            message += `⚠️ حجم فایل: ${fileSizeMB.toFixed(2)} MB (بیش از 100 مگابایت)\n`;
+                            const sizeReason = isVideo
+                                ? 'ویدیو بزرگ‌تر از 50 مگابایت است'
+                                : 'فایل بزرگ‌تر از 100 مگابایت است';
+                            message += `⚠️ ${sizeReason} (${fileSizeMB.toFixed(2)} MB)\n`;
 
                             const sendResult = await this.sendTelegramMessage(message, {
                                 chatIds: notifyTargets,
@@ -4229,7 +4206,55 @@ class VUMonitor {
         }
     }
 }
-if (require.main === module) {
+// `node app.js --resend <courseId> <bale|telegram|chat key>` marks a course's items as not yet
+// delivered to the matching chats, so the next run sends them again (files included).
+// Stop the bot first (pm2 stop) — a running bot would overwrite course_data.json.
+const runResendCommand = async (courseId, selector) => {
+    const helper = Object.create(VUMonitor.prototype);
+    const data = JSON.parse(await fs.readFile(DATA_FILE, 'utf8'));
+    const course = data[courseId];
+    if (!course) throw new Error(`Course ${courseId} not found in ${DATA_FILE}`);
+    helper.courseData = data;
+    const courseTargets = helper.getCourseTargetChatIds(courseId);
+    const selected = courseTargets
+        .filter(t => t.platform === selector || helper.getStorageKey(t) === selector)
+        .map(t => helper.getStorageKey(t));
+    if (selected.length === 0) {
+        throw new Error(`No configured chat of course ${courseId} matches "${selector}". Chats: ${courseTargets.map(t => helper.getStorageKey(t)).join(', ')}`);
+    }
+    const allKeys = courseTargets.map(t => helper.getStorageKey(t));
+    let notifications = 0;
+    for (const record of Object.values(course.sentNotifications || {})) {
+        const delivered = helper.getDeliveredTargetKeys(record, courseTargets);
+        record.targets = delivered.filter(key => !selected.includes(key));
+        record.platforms = [...new Set(record.targets.map(key => helper.parseStorageKey(key).platform))];
+        notifications++;
+    }
+    let files = 0;
+    for (const record of Object.values(course.sentFiles || {})) {
+        const delivered = Array.isArray(record.targets) ? record.targets : allKeys;
+        record.targets = delivered.filter(key => !selected.includes(key));
+        record.pendingTargets = selected;
+        files++;
+    }
+    await fs.writeFile(DATA_FILE, JSON.stringify(data, null, 2));
+    console.log(`✅ ${notifications} item(s) and ${files} attachment(s) of course ${courseId} will be re-sent to: ${selected.join(', ')} on the next run`);
+};
+
+const resendIndex = process.argv.indexOf('--resend');
+if (require.main === module && resendIndex !== -1) {
+    const [courseId, selector] = process.argv.slice(resendIndex + 1);
+    if (!courseId || !selector) {
+        console.error('Usage: node app.js --resend <courseId> <bale|telegram|chat key>');
+        process.exit(1);
+    }
+    runResendCommand(courseId, selector)
+        .then(() => process.exit(0))
+        .catch(error => {
+            console.error('❌', error.message);
+            process.exit(1);
+        });
+} else if (require.main === module) {
     const configuredPlatforms = CONFIG.activePlatforms.filter(platform => CONFIG.platforms[platform]?.token);
     if (configuredPlatforms.length === 0) {
         throw new Error('No bot token is configured. Set BALE_BOT_TOKEN and/or TG_BOT_TOKEN in .env.');
